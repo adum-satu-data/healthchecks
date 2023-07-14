@@ -5,3 +5,9 @@ __pycache__/
 hc.sqlite
 hc/local_settings.py
 static-collected
+dev-run-env.sh
+dev-run-migrate.sh
+dev-run-createsuperuser.sh
+dev-run-runserver.sh
+dev-run-sendalerts.sh
+dev-run-sendreports.sh
