@@ -16,9 +16,14 @@ from django.utils.timezone import now
 
 from hc.accounts.models import Profile
 from hc.api.schemas import telegram_migration
-from hc.front.templatetags.hc_extras import absolute_site_logo_url, sortchecks
+from hc.front.templatetags.hc_extras import (
+    absolute_site_logo_url,
+    fix_asterisks,
+    sortchecks,
+)
 from hc.lib import curl, emails, jsonschema
 from hc.lib.date import format_duration
+from hc.lib.html import extract_signal_styles
 from hc.lib.signing import sign_bounce_id
 from hc.lib.string import replace
 
@@ -77,12 +82,6 @@ def get_ping_body(ping, maxlen=None) -> str | None:
         body = body[:maxlen] + "\n[truncated]"
 
     return body
-
-
-def fix_asterisks(s):
-    """Prepend asterisks with "Combining Grapheme Joiner" characters."""
-
-    return s.replace("*", "\u034f*")
 
 
 class TransportError(Exception):
@@ -406,6 +405,7 @@ class Slackalike(HttpTransport):
 
         if check.kind == "cron":
             fields.add("Schedule", fix_asterisks(check.schedule))
+            fields.add("Time Zone", check.tz)
 
         fields.add("Total Pings", str(check.n_pings))
 
@@ -516,6 +516,7 @@ class PagerDuty(HttpTransport):
             details["Period"] = format_duration(check.timeout)
         if check.kind == "cron":
             details["Schedule"] = check.schedule
+            details["Time zone"] = check.tz
 
         description = tmpl("pd_description.html", check=check)
         payload = {
@@ -647,6 +648,7 @@ class RocketChat(HttpTransport):
 
         if check.kind == "cron":
             fields.add("Schedule", fix_asterisks(check.schedule))
+            fields.add("Time Zone", check.tz)
 
         fields.add("Total Pings", str(check.n_pings))
 
@@ -952,6 +954,7 @@ class MsTeams(HttpTransport):
 
         if check.kind == "cron":
             facts.append({"name": "Schedule:", "value": fix_asterisks(check.schedule)})
+            facts.append({"name": "Time Zone:", "value": check.tz})
 
         facts.append({"name": "Total Pings:", "value": str(check.n_pings)})
 
@@ -1045,10 +1048,15 @@ class Signal(Transport):
             return not self.channel.signal_notify_up
 
     def send(self, recipient: str, message: str) -> None:
+        plaintext, styles = extract_signal_styles(message)
         payload = {
             "jsonrpc": "2.0",
             "method": "send",
-            "params": {"recipient": [recipient], "message": message},
+            "params": {
+                "recipient": [recipient],
+                "message": plaintext,
+                "textStyle": styles,
+            },
             "id": str(uuid.uuid4()),
         }
 
@@ -1075,7 +1083,9 @@ class Signal(Transport):
                         if self.channel:
                             raw = reply_bytes.decode()
                             self.channel.send_signal_captcha_alert(result["token"], raw)
-                            self.channel.send_signal_rate_limited_notice(message)
+                            self.channel.send_signal_rate_limited_notice(
+                                message, plaintext
+                            )
                         raise TransportError("CAPTCHA proof required")
 
                 code = reply["error"].get("code")

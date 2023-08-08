@@ -57,6 +57,19 @@ class NotifyMsTeamsTestCase(BaseTestCase):
         self.assertNotIn(str(self.check.code), serialized)
 
     @patch("hc.api.transports.curl.request")
+    def test_it_shows_schedule_and_tz(self, mock_post):
+        mock_post.return_value.status_code = 200
+        self.check.kind = "cron"
+        self.check.tz = "Europe/Riga"
+        self.check.save()
+
+        self.channel.notify(self.check)
+        payload = mock_post.call_args.kwargs["json"]
+        facts = {f["name"]: f["value"] for f in payload["sections"][0]["facts"]}
+        self.assertEqual(facts["Schedule:"], "\u034f* \u034f* \u034f* \u034f* \u034f*")
+        self.assertEqual(facts["Time Zone:"], "Europe/Riga")
+
+    @patch("hc.api.transports.curl.request")
     def test_it_escapes_stars_in_schedule(self, mock_post):
         mock_post.return_value.status_code = 200
 

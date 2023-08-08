@@ -95,7 +95,9 @@ class NotifySignalTestCase(BaseTestCase):
         self.assertEqual(n.error, "")
 
         params = socketobj.req["params"]
-        self.assertIn("“Daily Backup” is DOWN", params["message"])
+        self.assertIn("Daily Backup is DOWN", params["message"])
+        self.assertEqual(params["textStyle"][0], "10:12:BOLD")
+
         self.assertIn("Project: Alices Project", params["message"])
         self.assertIn("Tags: foo, bar", params["message"])
         self.assertIn("Period: 1 day", params["message"])
@@ -106,6 +108,19 @@ class NotifySignalTestCase(BaseTestCase):
         # Only one check in the project, so there should be no note about
         # other checks:
         self.assertNotIn("All the other checks are up.", params["message"])
+
+    @patch("hc.api.transports.socket.socket")
+    def test_it_shows_schedule_and_tz(self, socket):
+        socketobj = setup_mock(socket, {})
+
+        self.check.kind = "cron"
+        self.check.tz = "Europe/Riga"
+        self.check.save()
+        self.channel.notify(self.check)
+
+        params = socketobj.req["params"]
+        self.assertIn("Schedule: * * * * *", params["message"])
+        self.assertIn("Time Zone: Europe/Riga", params["message"])
 
     @patch("hc.api.transports.socket.socket")
     def test_it_handles_special_characters(self, socket):
@@ -125,7 +140,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.assertEqual(n.error, "")
 
         params = socketobj.req["params"]
-        self.assertIn("“Foo & Co” is DOWN", params["message"])
+        self.assertIn("Foo & Co is DOWN", params["message"])
         self.assertIn("Project: Alice & Friends", params["message"])
         self.assertIn("Tags: foo, a&b", params["message"])
 
@@ -315,6 +330,9 @@ class NotifySignalTestCase(BaseTestCase):
         }
         setup_mock(socket, msg)
 
+        self.check.name = "Foo & Co"
+        self.check.save()
+
         self.channel.notify(self.check)
 
         n = Notification.objects.get()
@@ -330,8 +348,15 @@ class NotifySignalTestCase(BaseTestCase):
         email = emails["alice@example.org"]
         self.assertEqual(
             email.subject,
-            "Signal notification failed: The check “Daily Backup” is DOWN.",
+            "Signal notification failed: The check Foo & Co is DOWN.",
         )
+        # The plaintext version should have no HTML markup, and should
+        # have no &amp;, &lt; &gt; stuff:
+        self.assertIn("The check Foo & Co is DOWN.", email.body)
+        # The HTML version should retain styling, and escape special characters
+        # in project name, check name, etc.:
+        html = email.alternatives[0][0]
+        self.assertIn("The check <b>Foo &amp; Co</b> is <b>DOWN</b>.", html)
 
     @patch("hc.api.transports.socket.socket")
     def test_it_handles_null_data(self, socket):
