@@ -207,11 +207,6 @@ class Profile(models.Model):
         if last_ping is None or last_ping < six_months_ago:
             return False
 
-        # Is there at least one check that is down?
-        num_down = checks.filter(status="down").count()
-        if nag and num_down == 0:
-            return False
-
         # Sort checks by project. Need this because will group by project in
         # template.
         checks = checks.select_related("project")
@@ -226,32 +221,39 @@ class Profile(models.Model):
             "List-Unsubscribe": "<%s>" % unsub_url,
             "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
         }
-
-        if self.reports == "weekly":
-            boundaries = week_boundaries(3, self.tz)
-        else:
-            boundaries = month_boundaries(3, self.tz)
-
-        for check in checks:
-            # Calculate the downtimes, throw away the current period,
-            # keep two previous periods
-            check.past_downtimes = check.downtimes_by_boundary(boundaries)[:-1]
-
         ctx = {
-            "checks": checks,
             "sort": self.sort,
-            "now": now(),
             "unsub_link": unsub_url,
             "notifications_url": self.notifications_url(),
-            "nag": nag,
-            "nag_period": self.nag_period.total_seconds(),
-            "num_down": num_down,
-            "month_boundaries": boundaries[:-1],
-            "monthly_or_weekly": self.reports,
             "tz": self.tz,
         }
 
-        emails.report(self.user.email, ctx, headers)
+        if not nag:
+            # For weekly and monthly reports, calculate the downtimes,
+            # throw away the current period, keep two previous periods
+            if self.reports == "weekly":
+                boundaries = week_boundaries(3, self.tz)
+            else:
+                boundaries = month_boundaries(3, self.tz)
+
+            for check in checks:
+                check.past_downtimes = check.downtimes_by_boundary(boundaries)[:-1]
+
+            ctx["checks"] = checks
+            ctx["boundaries"] = boundaries[:-1]
+            ctx["monthly_or_weekly"] = self.reports
+            emails.report(self.user.email, ctx, headers)
+
+        if nag:
+            # For nags, only show checks that are currently down
+            checks = [c for c in checks if c.get_status() == "down"]
+            if not checks:
+                return False
+            ctx["checks"] = checks
+            ctx["num_down"] = len(checks)
+            ctx["nag_period"] = self.nag_period.total_seconds()
+            emails.nag(self.user.email, ctx, headers)
+
         return True
 
     def sms_sent_this_month(self):
@@ -398,7 +400,9 @@ class Project(models.Model):
 
         m = Member.objects.create(user=user, project=self, role=role)
         checks_url = reverse("hc-checks", args=[self.code])
-        user.profile.send_instant_login_link(membership=m, redirect_url=checks_url)
+
+        profile = Profile.objects.for_user(user)
+        profile.send_instant_login_link(membership=m, redirect_url=checks_url)
         return True
 
     def update_next_nag_dates(self):

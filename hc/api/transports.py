@@ -1190,7 +1190,11 @@ class Ntfy(HttpTransport):
         return self.priority(check) == 0
 
     def notify(self, check, notification=None) -> None:
-        ctx = {"check": check, "down_checks": self.down_checks(check)}
+        ctx = {
+            "check": check,
+            "ping": self.last_ping(check),
+            "down_checks": self.down_checks(check),
+        }
         payload = {
             "topic": self.channel.ntfy_topic,
             "priority": self.priority(check),
@@ -1206,4 +1210,8 @@ class Ntfy(HttpTransport):
             ],
         }
 
-        self.post(self.channel.ntfy_url, json=payload)
+        headers = {}
+        if self.channel.ntfy_token:
+            headers = {"Authorization": f"Bearer {self.channel.ntfy_token}"}
+
+        self.post(self.channel.ntfy_url, headers=headers, json=payload)

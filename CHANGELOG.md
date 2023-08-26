@@ -8,9 +8,15 @@ All notable changes to this project will be documented in this file.
 - Update Telegram integration to treat "bot was blocked by the user" as permanent error
 - Add "Time Zone" field in notifications that use the "Schedule" field (#863)
 - Add bold and monospace text formatting in Signal notifications
+- Update hourly/daily email reminders to only show checks in the "down" state (#881)
+- Add support for ntfy access tokens (#879)
+- Improve ntfy notifications (include tags, period, last ping type etc.)
+- Add an "Account closed." confirmation message after closing an account
 
 ### Bug Fixes
 - Fix "senddeletionnotices" to recognize "Supporter" subscriptions
+- Fix "createsuperuser" to reject already registered email addresses (#880)
+- Fix hc.accounts.views.check_token to handle non-UUID usernames (#882)
 
 ## v2.10 - 2023-07-02
 
