@@ -641,7 +641,7 @@ class Ping(models.Model):
             return self.object_size
         return 0
 
-    def get_kind_display(self):
+    def get_kind_display(self) -> str:
         if self.kind == "ign":
             return "Ignored"
         if self.kind == "fail":
@@ -676,7 +676,7 @@ class Ping(models.Model):
         return None
 
 
-def json_property(kind, field):
+def json_property(kind: str, field: str) -> property:
     def fget(instance):
         assert instance.kind == kind
         return instance.json[field]
@@ -692,7 +692,7 @@ class Channel(models.Model):
     kind = models.CharField(max_length=20, choices=CHANNEL_KINDS)
     value = models.TextField(blank=True)
     email_verified = models.BooleanField(default=False)
-    disabled = models.BooleanField(null=True)
+    disabled = models.BooleanField(default=False)
     last_notify = models.DateTimeField(null=True, blank=True)
     last_notify_duration = models.DurationField(null=True, blank=True)
     last_error = models.CharField(max_length=200, blank=True)
@@ -717,35 +717,35 @@ class Channel(models.Model):
 
         return self.get_kind_display()
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, str]:
         return {"id": str(self.code), "name": self.name, "kind": self.kind}
 
-    def is_editable(self):
+    def is_editable(self) -> bool:
         return self.kind in ("email", "webhook", "sms", "signal", "whatsapp", "ntfy")
 
-    def assign_all_checks(self):
+    def assign_all_checks(self) -> None:
         checks = Check.objects.filter(project=self.project)
         self.checks.add(*checks)
 
-    def make_token(self):
+    def make_token(self) -> str:
         seed = "%s%s" % (self.code, settings.SECRET_KEY)
         seed = seed.encode()
         return hashlib.sha1(seed).hexdigest()
 
-    def send_verify_link(self):
+    def send_verify_link(self) -> None:
         args = [self.code, self.make_token()]
         verify_link = reverse("hc-verify-email", args=args)
         verify_link = settings.SITE_ROOT + verify_link
         emails.verify_email(self.email_value, {"verify_link": verify_link})
 
-    def get_unsub_link(self):
+    def get_unsub_link(self) -> str:
         signer = TimestampSigner(salt="alerts")
         signed_token = signer.sign(self.make_token())
         args = [self.code, signed_token]
         verify_link = reverse("hc-unsubscribe-alerts", args=args)
         return settings.SITE_ROOT + verify_link
 
-    def send_signal_captcha_alert(self, challenge, raw):
+    def send_signal_captcha_alert(self, challenge: str, raw: str) -> None:
         subject = "Signal CAPTCHA proof required"
         message = f"Challenge token: {challenge}"
         hostname = socket.gethostname()
@@ -780,7 +780,7 @@ class Channel(models.Model):
         _, cls = TRANSPORTS[self.kind]
         return cls(self)
 
-    def notify(self, check, is_test=False):
+    def notify(self, check: Check, is_test: bool = False) -> str:
         if self.transport.is_noop(check):
             return "no-op"
 
@@ -813,8 +813,8 @@ class Channel(models.Model):
 
         return error
 
-    def icon_path(self):
-        return "img/integrations/%s.png" % self.kind
+    def icon_path(self) -> str:
+        return f"img/integrations/{self.kind}.png"
 
     @property
     def json(self):
@@ -1068,6 +1068,8 @@ class Channel(models.Model):
 
 class Notification(models.Model):
     code = models.UUIDField(default=uuid.uuid4, null=True, editable=False)
+    # owner is null for test notifications, produced by the "Test!" button
+    # in the Integrations page
     owner = models.ForeignKey(Check, models.CASCADE, null=True)
     check_status = models.CharField(max_length=6)
     channel = models.ForeignKey(Channel, models.CASCADE)
@@ -1077,7 +1079,7 @@ class Notification(models.Model):
     class Meta:
         get_latest_by = "created"
 
-    def status_url(self):
+    def status_url(self) -> str:
         path = reverse("hc-api-notification-status", args=[self.code])
         return settings.SITE_ROOT + path
 
@@ -1106,7 +1108,7 @@ class Flip(models.Model):
             "up": 1 if self.new_status == "up" else 0,
         }
 
-    def select_channels(self):
+    def select_channels(self) -> list[Channel]:
         """Return a list of channels that need to be notified.
 
         * Exclude all channels for new->up and paused->up transitions.
@@ -1119,7 +1121,7 @@ class Flip(models.Model):
             return []
 
         if self.new_status not in ("up", "down"):
-            raise NotImplementedError(f"Unexpected status: {self.status}")
+            raise NotImplementedError(f"Unexpected status: {self.new_status}")
 
         q = self.owner.channel_set.exclude(disabled=True)
         return [ch for ch in q if not ch.transport.is_noop(self.owner)]
@@ -1131,7 +1133,7 @@ class TokenBucket(models.Model):
     updated = models.DateTimeField(default=now)
 
     @staticmethod
-    def authorize(value, capacity, refill_time_secs):
+    def authorize(value: str, capacity: int, refill_time_secs: int) -> bool:
         frozen_now = now()
         obj, created = TokenBucket.objects.get_or_create(value=value)
 
@@ -1168,7 +1170,7 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 20, 3600)
 
     @staticmethod
-    def authorize_login_email(email):
+    def authorize_login_email(email: str) -> bool:
         # remove dots and alias:
         mailbox, domain = email.split("@")
         mailbox = mailbox.replace(".", "")
@@ -1197,14 +1199,14 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 20, 3600 * 24)
 
     @staticmethod
-    def authorize_telegram(telegram_id):
+    def authorize_telegram(telegram_id: str) -> bool:
         value = "tg-%s" % telegram_id
 
         # 6 messages for a single chat per minute:
         return TokenBucket.authorize(value, 6, 60)
 
     @staticmethod
-    def authorize_signal(phone):
+    def authorize_signal(phone: str) -> bool:
         salted_encoded = (phone + settings.SECRET_KEY).encode()
         value = "signal-%s" % hashlib.sha1(salted_encoded).hexdigest()
 
@@ -1219,7 +1221,7 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 50, 3600 * 24)
 
     @staticmethod
-    def authorize_pushover(user_key):
+    def authorize_pushover(user_key: str) -> bool:
         salted_encoded = (user_key + settings.SECRET_KEY).encode()
         value = "po-%s" % hashlib.sha1(salted_encoded).hexdigest()
         # 6 messages for a single user key per minute:
