@@ -6,7 +6,7 @@ import os
 import socket
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Iterator, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Iterator, List, NoReturn, Optional, cast
 from urllib.parse import quote, urlencode, urljoin
 
 from django.conf import settings
@@ -14,15 +14,15 @@ from django.contrib.humanize.templatetags.humanize import naturaltime
 from django.template.loader import render_to_string
 from django.utils.html import escape
 from django.utils.timezone import now
+from pydantic import BaseModel, ValidationError
 
 from hc.accounts.models import Profile
-from hc.api.schemas import telegram_migration
 from hc.front.templatetags.hc_extras import (
     absolute_site_logo_url,
     fix_asterisks,
     sortchecks,
 )
-from hc.lib import curl, emails, jsonschema
+from hc.lib import curl, emails
 from hc.lib.date import format_duration
 from hc.lib.html import extract_signal_styles
 from hc.lib.signing import sign_bounce_id
@@ -44,26 +44,6 @@ def tmpl(template_name: str, **ctx: Any) -> str:
     # \xa0 is non-breaking space. It causes SMS messages to use UCS2 encoding
     # and cost twice the money.
     return render_to_string(template_path, ctx).strip().replace("\xa0", " ")
-
-
-def get_nested(obj: object, path: str, default: object = None) -> Any:
-    """Retrieve a field from nested dictionaries.
-
-    Example:
-
-    >>> get_nested({"foo": {"bar": "baz"}}, "foo.bar")
-    'baz'
-
-    """
-
-    needle = obj
-    for key in path.split("."):
-        if not isinstance(needle, dict):
-            return default
-        if key not in needle:
-            return default
-        needle = needle[key]
-    return needle
 
 
 def get_ping_body(ping: Ping | None, maxlen: int | None = None) -> str | None:
@@ -329,10 +309,8 @@ class Webhook(HttpTransport):
         return result
 
     def is_noop(self, check: Check) -> bool:
-        if check.status == "down" and not self.channel.url_down:
-            return True
-
-        if check.status == "up" and not self.channel.url_up:
+        spec = self.channel.webhook_spec(check.status)
+        if not spec.url:
             return True
 
         return False
@@ -342,30 +320,31 @@ class Webhook(HttpTransport):
             raise TransportError("Webhook notifications are not enabled.")
 
         spec = self.channel.webhook_spec(check.status)
-        if not spec["url"]:
+        if not spec.url:
             raise TransportError("Empty webhook URL")
 
-        url = self.prepare(spec["url"], check, urlencode=True)
+        url = self.prepare(spec.url, check, urlencode=True)
         headers = {}
-        for key, value in spec["headers"].items():
+        for key, value in spec.headers.items():
             # Header values should contain ASCII and latin-1 only
             headers[key] = self.prepare(value, check, latin1=True)
 
-        body = spec["body"]
+        body, body_bytes = spec.body, None
         if body:
-            body = self.prepare(body, check, allow_ping_body=True).encode()
+            body = self.prepare(body, check, allow_ping_body=True)
+            body_bytes = body.encode()
 
         # When sending a test notification, don't retry on failures.
         use_retries = True
         if notification and notification.owner is None:
             use_retries = False  # this is a test notification
 
-        if spec["method"] == "GET":
+        if spec.method == "GET":
             self.get(url, use_retries=use_retries, headers=headers)
-        elif spec["method"] == "POST":
-            self.post(url, use_retries=use_retries, data=body, headers=headers)
-        elif spec["method"] == "PUT":
-            self.put(url, use_retries=use_retries, data=body, headers=headers)
+        elif spec.method == "POST":
+            self.post(url, use_retries=use_retries, data=body_bytes, headers=headers)
+        elif spec.method == "PUT":
+            self.put(url, use_retries=use_retries, data=body_bytes, headers=headers)
 
 
 class SlackFields(list):
@@ -466,14 +445,16 @@ class Discord(Slackalike):
 
 
 class Opsgenie(HttpTransport):
+    class ErrorModel(BaseModel):
+        message: str
+
     @classmethod
     def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            details = response.json().get("message")
-            if isinstance(details, str):
-                message += f' with a message: "{details}"'
-        except ValueError:
+            r = Opsgenie.ErrorModel.model_validate_json(response.content)
+            message += f' with a message: "{r.message}"'
+        except ValidationError:
             pass
 
         raise TransportError(message)
@@ -729,34 +710,35 @@ class MigrationRequiredError(TransportError):
 
 
 class Telegram(HttpTransport):
-    SM = "https://api.telegram.org/bot%s/sendMessage" % settings.TELEGRAM_TOKEN
+    SM = f"https://api.telegram.org/bot{settings.TELEGRAM_TOKEN}/sendMessage"
+
+    class MigrationParameters(BaseModel):
+        migrate_to_chat_id: int
+
+    class ErrorModel(BaseModel):
+        description: str
+        parameters: Optional[Telegram.MigrationParameters] = None
 
     @classmethod
     def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            doc = response.json()
-        except ValueError:
+            m = Telegram.ErrorModel.model_validate_json(response.content)
+        except ValidationError:
             raise TransportError(message)
 
-        # If the error payload contains the migrate_to_chat_id field,
-        # raise MigrationRequiredError, with the new chat_id included
-        try:
-            jsonschema.validate(doc, telegram_migration)
-            description = cast(str, doc["description"])
-            chat_id = doc["parameters"]["migrate_to_chat_id"]
-            raise MigrationRequiredError(description, chat_id)
-        except jsonschema.ValidationError:
-            pass
+        if m.parameters:
+            # If the error payload contains the migrate_to_chat_id field,
+            # raise MigrationRequiredError, with the new chat_id included
+            chat_id = m.parameters.migrate_to_chat_id
+            raise MigrationRequiredError(m.description, chat_id)
 
         permanent = False
-        description = doc.get("description")
-        if isinstance(description, str):
-            message += f' with a message: "{description}"'
-            if description == "Forbidden: the group chat was deleted":
-                permanent = True
-            if description == "Forbidden: bot was blocked by the user":
-                permanent = True
+        message += f' with a message: "{m.description}"'
+        if m.description == "Forbidden: the group chat was deleted":
+            permanent = True
+        if m.description == "Forbidden: bot was blocked by the user":
+            permanent = True
 
         raise TransportError(message, permanent=permanent)
 
@@ -990,14 +972,16 @@ class MsTeams(HttpTransport):
 
 
 class Zulip(HttpTransport):
+    class ErrorModel(BaseModel):
+        msg: str
+
     @classmethod
     def raise_for_response(cls, response: curl.Response) -> NoReturn:
         message = f"Received status code {response.status_code}"
         try:
-            details = response.json().get("msg")
-            if isinstance(details, str):
-                message += f' with a message: "{details}"'
-        except ValueError:
+            f = Zulip.ErrorModel.model_validate_json(response.content)
+            message += f' with a message: "{f.msg}"'
+        except ValidationError:
             pass
 
         raise TransportError(message)
@@ -1051,14 +1035,50 @@ class LineNotify(HttpTransport):
         self.post(self.URL, headers=headers, params=payload)
 
 
+class SignalRateLimitFailure(TransportError):
+    def __init__(self, token: str, reply: bytes):
+        super().__init__("CAPTCHA proof required")
+        self.token = token
+        self.reply = reply
+
+
 class Signal(Transport):
+    class Recipient(BaseModel):
+        number: str
+
+    class Result(BaseModel):
+        type: str
+        recipientAddress: Signal.Recipient
+        token: Optional[str] = None
+
+    class Response(BaseModel):
+        results: List[Signal.Result]
+
+    class Data(BaseModel):
+        response: Signal.Response
+
+    class Error(BaseModel):
+        code: int
+        data: Optional[Signal.Data] = None
+
+    class Reply(BaseModel):
+        id: str
+        error: Optional[Signal.Error] = None
+
+        def get_results(self) -> List[Signal.Result]:
+            assert self.error
+            if self.error.data is None:
+                return []
+            return self.error.data.response.results
+
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
             return not self.channel.signal_notify_down
         else:
             return not self.channel.signal_notify_up
 
-    def send(self, recipient: str, message: str) -> None:
+    @classmethod
+    def send(cls, recipient: str, message: str) -> None:
         plaintext, styles = extract_signal_styles(message)
         payload = {
             "jsonrpc": "2.0",
@@ -1072,39 +1092,32 @@ class Signal(Transport):
         }
 
         payload_bytes = (json.dumps(payload) + "\n").encode()
-        for reply_bytes in self._read_replies(payload_bytes):
+        for reply_bytes in cls._read_replies(payload_bytes):
             try:
-                reply = json.loads(reply_bytes.decode())
-            except ValueError:
+                reply = Signal.Reply.model_validate_json(reply_bytes)
+            except ValidationError:
                 raise TransportError("signal-cli call failed (unexpected response)")
 
-            if reply.get("id") == payload["id"]:
-                if "error" not in reply:
-                    # success!
-                    break
+            if reply.id != payload["id"]:
+                continue
 
-                results = get_nested(reply, "error.data.response.results", [])
-                assert isinstance(results, list)
-                for result in results:
-                    if get_nested(result, "recipientAddress.number") != recipient:
-                        continue
+            if reply.error is None:
+                break  # success!
 
-                    assert isinstance(result, dict)
-                    if result.get("type") == "UNREGISTERED_FAILURE":
-                        raise TransportError("Recipient not found")
+            for result in reply.get_results():
+                if result.recipientAddress.number != recipient:
+                    continue
 
-                    if result.get("type") == "RATE_LIMIT_FAILURE" and "token" in result:
-                        if self.channel:
-                            raw = reply_bytes.decode()
-                            self.channel.send_signal_captcha_alert(result["token"], raw)
-                            self.channel.send_signal_rate_limited_notice(
-                                message, plaintext
-                            )
-                        raise TransportError("CAPTCHA proof required")
+                if result.type == "UNREGISTERED_FAILURE":
+                    raise TransportError("Recipient not found")
 
-                code = reply["error"].get("code")
-                raise TransportError("signal-cli call failed (%s)" % code)
+                if result.type == "RATE_LIMIT_FAILURE" and result.token:
+                    raise SignalRateLimitFailure(result.token, reply_bytes)
 
+            code = reply.error.code
+            raise TransportError(f"signal-cli call failed ({code})")
+
+    @classmethod
     def _read_replies(self, payload_bytes: bytes) -> Iterator[bytes]:
         """Send a request to signal-cli over UNIX socket. Read and yield replies.
 
@@ -1173,7 +1186,13 @@ class Signal(Transport):
             "down_checks": self.down_checks(check),
         }
         text = tmpl("signal_message.html", **ctx)
-        self.send(self.channel.phone_number, text)
+        try:
+            self.send(self.channel.phone_number, text)
+        except SignalRateLimitFailure as e:
+            self.channel.send_signal_captcha_alert(e.token, e.reply.decode())
+            plaintext, _ = extract_signal_styles(text)
+            self.channel.send_signal_rate_limited_notice(text, plaintext)
+            raise e
 
 
 class Gotify(HttpTransport):

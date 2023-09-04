@@ -804,17 +804,20 @@ def _get_events(check: Check, page_limit: int, start=None, end=None):
         for ping in pings:
             ping.duration = None
 
-    alerts = Notification.objects.select_related("channel")
-    alerts = alerts.filter(owner=check, check_status="down")
+    alerts: list[Notification]
+    q = Notification.objects.select_related("channel")
+    q = q.filter(owner=check, check_status="down")
     if start and end:
-        alerts = alerts.filter(created__gte=start, created__lte=end)
+        q = q.filter(created__gte=start, created__lte=end)
+        alerts = list(q)
     elif len(pings):
         cutoff = pings[-1].created
-        alerts = alerts.filter(created__gt=cutoff)
+        q = q.filter(created__gt=cutoff)
+        alerts = list(q)
     else:
         alerts = []
 
-    events = pings + list(alerts)
+    events = pings + alerts
     events.sort(key=lambda el: el.created, reverse=True)
     return events
 
@@ -2480,7 +2483,7 @@ def signal_captcha(request: HttpRequest) -> HttpResponse:
         }
 
         payload_bytes = (json.dumps(payload) + "\n").encode()
-        for reply_bytes in Signal(None)._read_replies(payload_bytes):
+        for reply_bytes in Signal._read_replies(payload_bytes):
             try:
                 reply = json.loads(reply_bytes.decode())
             except ValueError:
@@ -2515,7 +2518,7 @@ def verify_signal_number(request: HttpRequest) -> HttpResponse:
         return render_result("Verification rate limit exceeded")
 
     try:
-        Signal(None).send(phone, f"Test message from {settings.SITE_NAME}")
+        Signal.send(phone, f"Test message from {settings.SITE_NAME}")
     except TransportError as e:
         return render_result(e.message)
 
