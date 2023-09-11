@@ -65,33 +65,33 @@ def enc(n: int) -> str:
     return len_inverted + inverted + "-" + s
 
 
-@statsd.timer("hc.lib.s3.getObjectTime")
-def get_object(code, n):
+def get_object(code: str, n: int) -> bytes | None:
     if not settings.S3_BUCKET:
         return None
 
-    key = "%s/%s" % (code, enc(n))
-    response = None
-    try:
-        response = client().get_object(settings.S3_BUCKET, key)
-        return response.read()
-    except S3Error as e:
-        if e.code == "NoSuchKey":
-            # It's not an error condition if an object does not exist.
-            # Return None, don't log exception, don't increase error counter.
-            return None
+    with statsd.timer("hc.lib.s3.getObjectTime"):
+        key = "%s/%s" % (code, enc(n))
+        response = None
+        try:
+            response = client().get_object(settings.S3_BUCKET, key)
+            return response.read()
+        except S3Error as e:
+            if e.code == "NoSuchKey":
+                # It's not an error condition if an object does not exist.
+                # Return None, don't log exception, don't increase error counter.
+                return None
 
-        logger.exception("S3Error in hc.lib.s3.get_object")
-        statsd.incr("hc.lib.s3.getObjectErrors")
-        return None
-    except HTTPError:
-        logger.exception("HTTPError in hc.lib.s3.get_object")
-        statsd.incr("hc.lib.s3.getObjectErrors")
-        return None
-    finally:
-        if response:
-            response.close()
-            response.release_conn()
+            logger.exception("S3Error in hc.lib.s3.get_object")
+            statsd.incr("hc.lib.s3.getObjectErrors")
+            return None
+        except HTTPError:
+            logger.exception("HTTPError in hc.lib.s3.get_object")
+            statsd.incr("hc.lib.s3.getObjectErrors")
+            return None
+        finally:
+            if response:
+                response.close()
+                response.release_conn()
 
 
 def put_object(code, n: int, data: bytes) -> None:
@@ -131,7 +131,7 @@ def _remove_objects(code, upto_n):
             statsd.incr("hc.lib.s3.removeObjectsErrors")
 
 
-def remove_objects(check_code, upto_n):
+def remove_objects(check_code: str, upto_n: int) -> None:
     """Remove keys with n values below or equal to `upto_n`.
 
     The S3 API calls can take seconds to complete,

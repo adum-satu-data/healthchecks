@@ -6,7 +6,8 @@ import os
 import socket
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Iterator, List, NoReturn, Optional, cast
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import quote, urlencode, urljoin
 
 from django.conf import settings
@@ -154,7 +155,7 @@ class Email(Transport):
         # If this email address has an associated account, include
         # a summary of projects the account has access to
         try:
-            profile = Profile.objects.get(user__email=self.channel.email_value)
+            profile = Profile.objects.get(user__email=self.channel.email.value)
             projects = list(profile.projects())
         except Profile.DoesNotExist:
             projects = None
@@ -169,13 +170,13 @@ class Email(Transport):
             "unsub_link": unsub_link,
         }
 
-        emails.alert(self.channel.email_value, ctx, headers)
+        emails.alert(self.channel.email.value, ctx, headers)
 
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
-            return not self.channel.email_notify_down
+            return not self.channel.email.notify_down
         else:
-            return not self.channel.email_notify_up
+            return not self.channel.email.notify_up
 
 
 class Shell(Transport):
@@ -196,10 +197,10 @@ class Shell(Transport):
         return replace(template, ctx)
 
     def is_noop(self, check: Check) -> bool:
-        if check.status == "down" and not self.channel.cmd_down:
+        if check.status == "down" and not self.channel.shell.cmd_down:
             return True
 
-        if check.status == "up" and not self.channel.cmd_up:
+        if check.status == "up" and not self.channel.shell.cmd_up:
             return True
 
         return False
@@ -209,9 +210,9 @@ class Shell(Transport):
             raise TransportError("Shell commands are not enabled")
 
         if check.status == "up":
-            cmd = self.channel.cmd_up
+            cmd = self.channel.shell.cmd_up
         elif check.status == "down":
-            cmd = self.channel.cmd_down
+            cmd = self.channel.shell.cmd_down
 
         cmd = self.prepare(cmd, check)
         code = os.system(cmd)
@@ -510,7 +511,7 @@ class PagerDuty(HttpTransport):
 
         description = tmpl("pd_description.html", check=check)
         payload = {
-            "service_key": self.channel.pd_service_key,
+            "service_key": self.channel.pd.service_key,
             "incident_key": str(check.code),
             "event_type": "trigger" if check.status == "down" else "resolve",
             "description": description,
@@ -717,7 +718,7 @@ class Telegram(HttpTransport):
 
     class ErrorModel(BaseModel):
         description: str
-        parameters: Optional[Telegram.MigrationParameters] = None
+        parameters: Telegram.MigrationParameters | None = None
 
     @classmethod
     def raise_for_response(cls, response: curl.Response) -> NoReturn:
@@ -743,7 +744,7 @@ class Telegram(HttpTransport):
         raise TransportError(message, permanent=permanent)
 
     @classmethod
-    def send(cls, chat_id: str, thread_id: str, text: str) -> None:
+    def send(cls, chat_id: int, thread_id: int | None, text: str) -> None:
         # Telegram.send is a separate method because it is also used in
         # hc.front.views.telegram_bot to send invite links.
         payload = {
@@ -757,7 +758,7 @@ class Telegram(HttpTransport):
     def notify(self, check: Check, notification: Notification | None = None) -> None:
         from hc.api.models import TokenBucket
 
-        if not TokenBucket.authorize_telegram(self.channel.telegram_id):
+        if not TokenBucket.authorize_telegram(self.channel.telegram.id):
             raise TransportError("Rate limit exceeded")
 
         ping = self.last_ping(check)
@@ -772,11 +773,11 @@ class Telegram(HttpTransport):
         text = tmpl("telegram_message.html", **ctx)
 
         try:
-            self.send(self.channel.telegram_id, self.channel.telegram_thread_id, text)
+            self.send(self.channel.telegram.id, self.channel.telegram.thread_id, text)
         except MigrationRequiredError as e:
             # Save the new chat_id, then try sending again:
             self.channel.update_telegram_id(e.new_chat_id)
-            self.send(self.channel.telegram_id, self.channel.telegram_thread_id, text)
+            self.send(self.channel.telegram.id, self.channel.telegram.thread_id, text)
 
 
 class Sms(HttpTransport):
@@ -784,9 +785,9 @@ class Sms(HttpTransport):
 
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
-            return not self.channel.sms_notify_down
+            return not self.channel.phone.notify_down
         else:
-            return not self.channel.sms_notify_up
+            return not self.channel.phone.notify_up
 
     def notify(self, check: Check, notification: Notification | None = None) -> None:
         profile = Profile.objects.for_user(self.channel.project.owner)
@@ -799,13 +800,14 @@ class Sms(HttpTransport):
         text = tmpl("sms_message.html", check=check, site_name=settings.SITE_NAME)
 
         data = {
-            "To": self.channel.phone_number,
+            "To": self.channel.phone.value,
             "Body": text,
         }
 
         if settings.TWILIO_MESSAGING_SERVICE_SID:
             data["MessagingServiceSid"] = settings.TWILIO_MESSAGING_SERVICE_SID
         else:
+            assert settings.TWILIO_FROM
             data["From"] = settings.TWILIO_FROM
 
         if notification:
@@ -832,7 +834,7 @@ class Call(HttpTransport):
 
         data = {
             "From": settings.TWILIO_FROM,
-            "To": self.channel.phone_number,
+            "To": self.channel.phone.value,
             "Twiml": twiml,
         }
 
@@ -847,9 +849,9 @@ class WhatsApp(HttpTransport):
 
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
-            return not self.channel.whatsapp_notify_down
+            return not self.channel.phone.notify_down
         else:
-            return not self.channel.whatsapp_notify_up
+            return not self.channel.phone.notify_up
 
     def notify(self, check: Check, notification: Notification | None = None) -> None:
         profile = Profile.objects.for_user(self.channel.project.owner)
@@ -862,7 +864,7 @@ class WhatsApp(HttpTransport):
         text = tmpl("whatsapp_message.html", check=check, site_name=settings.SITE_NAME)
 
         data = {
-            "To": f"whatsapp:{self.channel.phone_number}",
+            "To": f"whatsapp:{self.channel.phone.value}",
             "Body": text,
         }
 
@@ -1049,23 +1051,23 @@ class Signal(Transport):
     class Result(BaseModel):
         type: str
         recipientAddress: Signal.Recipient
-        token: Optional[str] = None
+        token: str | None = None
 
     class Response(BaseModel):
-        results: List[Signal.Result]
+        results: list[Signal.Result]
 
     class Data(BaseModel):
         response: Signal.Response
 
     class Error(BaseModel):
         code: int
-        data: Optional[Signal.Data] = None
+        data: Signal.Data | None = None
 
     class Reply(BaseModel):
         id: str
-        error: Optional[Signal.Error] = None
+        error: Signal.Error | None = None
 
-        def get_results(self) -> List[Signal.Result]:
+        def get_results(self) -> list[Signal.Result]:
             assert self.error
             if self.error.data is None:
                 return []
@@ -1073,9 +1075,9 @@ class Signal(Transport):
 
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
-            return not self.channel.signal_notify_down
+            return not self.channel.phone.notify_down
         else:
-            return not self.channel.signal_notify_up
+            return not self.channel.phone.notify_up
 
     @classmethod
     def send(cls, recipient: str, message: str) -> None:
@@ -1177,7 +1179,7 @@ class Signal(Transport):
 
         from hc.api.models import TokenBucket
 
-        if not TokenBucket.authorize_signal(self.channel.phone_number):
+        if not TokenBucket.authorize_signal(self.channel.phone.value):
             raise TransportError("Rate limit exceeded")
 
         ctx = {
@@ -1187,7 +1189,7 @@ class Signal(Transport):
         }
         text = tmpl("signal_message.html", **ctx)
         try:
-            self.send(self.channel.phone_number, text)
+            self.send(self.channel.phone.value, text)
         except SignalRateLimitFailure as e:
             self.channel.send_signal_captcha_alert(e.token, e.reply.decode())
             plaintext, _ = extract_signal_styles(text)

@@ -3,35 +3,32 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
-import sys
 import uuid
 from datetime import datetime
 from datetime import timedelta as td
 from datetime import timezone
-from typing import Dict, TypedDict
+from typing import Any, TypedDict
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 from cronsim import CronSim
 from django.conf import settings
+from django.contrib.auth.models import User
 from django.core.mail import mail_admins
 from django.core.signing import TimestampSigner
 from django.db import models, transaction
+from django.db.models import QuerySet
+from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.timezone import now
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
 from hc.api import transports
 from hc.lib import emails
 from hc.lib.date import month_boundaries
 from hc.lib.s3 import get_object, put_object, remove_objects
-
-if sys.version_info >= (3, 9):
-    from zoneinfo import ZoneInfo
-else:
-    from backports.zoneinfo import ZoneInfo
-
 
 STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused"))
 DEFAULT_TIMEOUT = td(days=1)
@@ -41,7 +38,7 @@ CHECK_KINDS = (("simple", "Simple"), ("cron", "Cron"))
 # max time between start and ping where we will consider both events related:
 MAX_DURATION = td(hours=72)
 
-TRANSPORTS = {
+TRANSPORTS: dict[str, tuple[str, type[transports.Transport]]] = {
     "apprise": ("Apprise", transports.Apprise),
     "call": ("Phone Call", transports.Call),
     "discord": ("Discord", transports.Discord),
@@ -74,6 +71,7 @@ TRANSPORTS = {
     "zulip": ("Zulip", transports.Zulip),
 }
 
+
 CHANNEL_KINDS = [(kind, label_cls[0]) for kind, label_cls in TRANSPORTS.items()]
 
 PO_PRIORITIES = {
@@ -95,7 +93,7 @@ NTFY_PRIORITIES = {
 }
 
 
-def isostring(dt) -> str | None:
+def isostring(dt: datetime | None) -> str | None:
     """Convert the datetime to ISO 8601 format with no microseconds."""
     return dt.replace(microsecond=0).isoformat() if dt else None
 
@@ -133,7 +131,7 @@ class CheckDict(TypedDict, total=False):
 
 
 class DowntimeSummary(object):
-    def __init__(self, boundaries: list[datetime]):
+    def __init__(self, boundaries: list[datetime]) -> None:
         self.boundaries = list(sorted(boundaries, reverse=True))
         self.durations = [td() for _ in boundaries]
         self.counts = [0 for _ in boundaries]
@@ -191,7 +189,7 @@ class Check(models.Model):
             models.Index(fields=["project_id", "slug"], name="api_check_project_slug"),
         ]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "%s (%d)" % (self.name or self.code, self.id)
 
     def name_then_code(self) -> str:
@@ -218,7 +216,7 @@ class Check(models.Model):
 
         return settings.PING_ENDPOINT + str(self.code)
 
-    def details_url(self, full=True) -> str:
+    def details_url(self, full: bool = True) -> str:
         result = reverse("hc-details", args=[self.code])
         return settings.SITE_ROOT + result if full else result
 
@@ -471,7 +469,7 @@ class Check(models.Model):
 
         # Remove ping bodies from object storage
         if settings.S3_BUCKET:
-            remove_objects(self.code, threshold)
+            remove_objects(str(self.code), threshold)
 
         # Remove ping objects from db
         self.ping_set.filter(n__lte=threshold).delete()
@@ -483,11 +481,13 @@ class Check(models.Model):
             pass
 
     @property
-    def visible_pings(self):
+    def visible_pings(self) -> QuerySet["Ping"]:
         threshold = self.n_pings - self.project.owner_profile.ping_log_limit
         return self.ping_set.filter(n__gt=threshold)
 
-    def downtimes_by_boundary(self, boundaries: list[datetime]):
+    def downtimes_by_boundary(
+        self, boundaries: list[datetime]
+    ) -> list[tuple[datetime, td | None, int | None]]:
         """Calculate downtime counts and durations for the given time intervals.
 
         Returns a list of (datetime, downtime_in_secs, number_of_outages) tuples
@@ -532,7 +532,9 @@ class Check(models.Model):
         result.sort()
         return result
 
-    def downtimes(self, months: int, tz: str):
+    def downtimes(
+        self, months: int, tz: str
+    ) -> list[tuple[datetime, td | None, int | None]]:
         boundaries = month_boundaries(months, tz)
         return self.downtimes_by_boundary(boundaries)
 
@@ -619,8 +621,8 @@ class Ping(models.Model):
     def get_body_bytes(self) -> bytes | None:
         if self.body:
             return self.body.encode()
-        if self.object_size:
-            return get_object(self.owner.code, self.n)
+        if self.object_size and self.n:
+            return get_object(str(self.owner.code), self.n)
         if self.body_raw:
             return self.body_raw
 
@@ -678,9 +680,11 @@ class Ping(models.Model):
 
 
 def json_property(kind: str, field: str) -> property:
-    def fget(instance):
+    def fget(instance: Channel) -> int | str:
         assert instance.kind == kind
-        return instance.json[field]
+        v = instance.json[field]
+        assert isinstance(v, int) or isinstance(v, str)
+        return v
 
     return property(fget)
 
@@ -689,7 +693,52 @@ class WebhookSpec(BaseModel):
     method: str
     url: str
     body: str
-    headers: Dict[str, str]
+    headers: dict[str, str]
+
+
+class TelegramConf(BaseModel):
+    id: int
+    thread_id: int | None = None
+    type: str | None = None
+    name: str | None = None
+
+
+class ShellConf(BaseModel):
+    cmd_down: str
+    cmd_up: str
+
+
+class PdConf(BaseModel):
+    service_key: str
+    account: str | None = None
+
+    @classmethod
+    def load(cls, data: Any) -> PdConf:
+        # Is it plain service_key value?
+        if not data.startswith("{"):
+            return cls.model_validate({"service_key": data})
+
+        return super().model_validate_json(data)
+
+
+class PhoneConf(BaseModel):
+    value: str
+    notify_up: bool | None = Field(None, alias="up")
+    notify_down: bool | None = Field(None, alias="down")
+
+
+class EmailConf(BaseModel):
+    value: str
+    notify_up: bool = Field(alias="up")
+    notify_down: bool = Field(alias="down")
+
+    @classmethod
+    def load(cls, data: Any) -> EmailConf:
+        # Is it a plain email address?
+        if not data.startswith("{"):
+            return cls.model_validate({"value": data, "up": True, "down": True})
+
+        return super().model_validate_json(data)
 
 
 class Channel(models.Model):
@@ -706,17 +755,17 @@ class Channel(models.Model):
     last_error = models.CharField(max_length=200, blank=True)
     checks = models.ManyToManyField(Check)
 
-    def __str__(self):
+    def __str__(self) -> str:
         if self.name:
             return self.name
         if self.kind == "email":
-            return "Email to %s" % self.email_value
+            return "Email to %s" % self.email.value
         elif self.kind == "sms":
-            return "SMS to %s" % self.phone_number
+            return "SMS to %s" % self.phone.value
         elif self.kind == "slack":
             return "Slack %s" % self.slack_channel
         elif self.kind == "telegram":
-            return "Telegram %s" % self.telegram_name
+            return "Telegram %s" % self.telegram.name
         elif self.kind == "zulip":
             if self.zulip_type == "stream":
                 return "Zulip stream %s" % self.zulip_to
@@ -744,7 +793,7 @@ class Channel(models.Model):
         args = [self.code, self.make_token()]
         verify_link = reverse("hc-verify-email", args=args)
         verify_link = settings.SITE_ROOT + verify_link
-        emails.verify_email(self.email_value, {"verify_link": verify_link})
+        emails.verify_email(self.email.value, {"verify_link": verify_link})
 
     def get_unsub_link(self) -> str:
         signer = TimestampSigner(salt="alerts")
@@ -770,10 +819,10 @@ class Channel(models.Model):
         """
         mail_admins(subject, message, html_message=html_message)
 
-    def send_signal_rate_limited_notice(self, message: str, plaintext: str):
+    def send_signal_rate_limited_notice(self, message: str, plaintext: str) -> None:
         email = self.project.owner.email
         ctx = {
-            "recipient": self.phone_number,
+            "recipient": self.phone.value,
             "subject": plaintext.split("\n")[0],
             "message": message,
             "plaintext": plaintext,
@@ -781,7 +830,7 @@ class Channel(models.Model):
         emails.signal_rate_limited(email, ctx)
 
     @property
-    def transport(self):
+    def transport(self) -> transports.Transport:
         if self.kind not in TRANSPORTS:
             raise NotImplementedError(f"Unknown channel kind: {self.kind}")
 
@@ -825,11 +874,11 @@ class Channel(models.Model):
         return f"img/integrations/{self.kind}.png"
 
     @property
-    def json(self):
+    def json(self) -> Any:
         return json.loads(self.value)
 
     @property
-    def po_priority(self):
+    def po_priority(self) -> str:
         assert self.kind == "po"
         parts = self.value.split("|")
         prio = int(parts[1])
@@ -855,45 +904,55 @@ class Channel(models.Model):
     def up_webhook_spec(self) -> WebhookSpec:
         return self.webhook_spec("up")
 
-    cmd_down = json_property("shell", "cmd_down")
-    cmd_up = json_property("shell", "cmd_up")
+    @property
+    def shell(self) -> ShellConf:
+        assert self.kind == "shell"
+        return ShellConf.model_validate_json(self.value)
 
     @property
-    def slack_team(self):
+    def slack_team(self) -> str | None:
         assert self.kind == "slack"
         if not self.value.startswith("{"):
             return None
 
         doc = json.loads(self.value)
         if "team_name" in doc:
+            assert isinstance(doc["team_name"], str)
             return doc["team_name"]
 
         if "team" in doc:
+            assert isinstance(doc["team"]["name"], str)
             return doc["team"]["name"]
 
+        return None
+
     @property
-    def slack_channel(self):
+    def slack_channel(self) -> str | None:
         assert self.kind == "slack"
         if not self.value.startswith("{"):
             return None
 
         doc = json.loads(self.value)
-        return doc["incoming_webhook"]["channel"]
+        v = doc["incoming_webhook"]["channel"]
+        assert isinstance(v, str)
+        return v
 
     @property
-    def slack_webhook_url(self):
+    def slack_webhook_url(self) -> str:
         assert self.kind in ("slack", "mattermost")
         if not self.value.startswith("{"):
             return self.value
 
         doc = json.loads(self.value)
-        return doc["incoming_webhook"]["url"]
+        v = doc["incoming_webhook"]["url"]
+        assert isinstance(v, str)
+        return v
 
     @property
-    def discord_webhook_url(self):
+    def discord_webhook_url(self) -> str:
         assert self.kind == "discord"
         url = self.json["webhook"]["url"]
-
+        assert isinstance(url, str)
         # Discord migrated to discord.com,
         # and is dropping support for discordapp.com on 7 November 2020
         if url.startswith("https://discordapp.com/"):
@@ -902,104 +961,41 @@ class Channel(models.Model):
         return url
 
     @property
-    def telegram_id(self):
+    def telegram(self) -> TelegramConf:
         assert self.kind == "telegram"
-        return self.json.get("id")
+        return TelegramConf.model_validate_json(self.value)
 
-    @property
-    def telegram_thread_id(self):
-        assert self.kind == "telegram"
-        return self.json.get("thread_id")
-
-    @property
-    def telegram_type(self):
-        assert self.kind == "telegram"
-        return self.json.get("type")
-
-    @property
-    def telegram_name(self):
-        assert self.kind == "telegram"
-        return self.json.get("name")
-
-    def update_telegram_id(self, new_chat_id) -> None:
-        doc = self.json
+    def update_telegram_id(self, new_chat_id: int) -> None:
+        doc = json.loads(self.value)
         doc["id"] = new_chat_id
         self.value = json.dumps(doc)
         self.save()
 
     @property
-    def pd_service_key(self):
+    def pd(self) -> PdConf:
         assert self.kind == "pd"
-        if not self.value.startswith("{"):
-            return self.value
-
-        return self.json["service_key"]
+        return PdConf.load(self.value)
 
     @property
-    def pd_account(self):
-        assert self.kind == "pd"
-        if self.value.startswith("{"):
-            return self.json.get("account")
-
-    @property
-    def phone_number(self):
+    def phone(self) -> PhoneConf:
         assert self.kind in ("call", "sms", "whatsapp", "signal")
-        if self.value.startswith("{"):
-            return self.json["value"]
-
-        return self.value
+        return PhoneConf.model_validate_json(self.value)
 
     trello_token = json_property("trello", "token")
     trello_list_id = json_property("trello", "list_id")
 
     @property
-    def trello_board_list(self):
+    def trello_board_list(self) -> tuple[str, str]:
         assert self.kind == "trello"
         doc = json.loads(self.value)
         return doc["board_name"], doc["list_name"]
 
     @property
-    def email_value(self):
-        assert self.kind == "email"
-        if not self.value.startswith("{"):
-            return self.value
-
-        return self.json["value"]
+    def email(self) -> EmailConf:
+        return EmailConf.load(self.value)
 
     @property
-    def email_notify_up(self):
-        assert self.kind == "email"
-        if not self.value.startswith("{"):
-            return True
-
-        return self.json.get("up")
-
-    @property
-    def email_notify_down(self):
-        assert self.kind == "email"
-        if not self.value.startswith("{"):
-            return True
-
-        return self.json.get("down")
-
-    whatsapp_notify_up = json_property("whatsapp", "up")
-    whatsapp_notify_down = json_property("whatsapp", "down")
-
-    signal_notify_up = json_property("signal", "up")
-    signal_notify_down = json_property("signal", "down")
-
-    @property
-    def sms_notify_up(self):
-        assert self.kind == "sms"
-        return self.json.get("up", False)
-
-    @property
-    def sms_notify_down(self):
-        assert self.kind == "sms"
-        return self.json.get("down", True)
-
-    @property
-    def opsgenie_key(self):
+    def opsgenie_key(self) -> str:
         assert self.kind == "opsgenie"
         if not self.value.startswith("{"):
             return self.value
@@ -1007,7 +1003,7 @@ class Channel(models.Model):
         return self.json["key"]
 
     @property
-    def opsgenie_region(self):
+    def opsgenie_region(self) -> str:
         assert self.kind == "opsgenie"
         if not self.value.startswith("{"):
             return "us"
@@ -1020,7 +1016,7 @@ class Channel(models.Model):
     zulip_to = json_property("zulip", "to")
 
     @property
-    def zulip_site(self):
+    def zulip_site(self) -> str:
         assert self.kind == "zulip"
         doc = json.loads(self.value)
         if "site" in doc:
@@ -1032,12 +1028,12 @@ class Channel(models.Model):
         return "https://" + domain
 
     @property
-    def zulip_topic(self):
+    def zulip_topic(self) -> str:
         assert self.kind == "zulip"
         return self.json.get("topic", "")
 
     @property
-    def linenotify_token(self):
+    def linenotify_token(self) -> str:
         assert self.kind == "linenotify"
         return self.value
 
@@ -1050,12 +1046,12 @@ class Channel(models.Model):
     ntfy_priority_up = json_property("ntfy", "priority_up")
 
     @property
-    def ntfy_token(self):
+    def ntfy_token(self) -> str | None:
         assert self.kind == "ntfy"
         return self.json.get("token")
 
     @property
-    def ntfy_priority_display(self):
+    def ntfy_priority_display(self) -> str:
         return NTFY_PRIORITIES[self.ntfy_priority]
 
 
@@ -1077,6 +1073,11 @@ class Notification(models.Model):
         return settings.SITE_ROOT + path
 
 
+class FlipDict(TypedDict):
+    timestamp: str
+    up: int
+
+
 class Flip(models.Model):
     owner = models.ForeignKey(Check, models.CASCADE)
     created = models.DateTimeField()
@@ -1095,9 +1096,9 @@ class Flip(models.Model):
             )
         ]
 
-    def to_dict(self):
+    def to_dict(self) -> FlipDict:
         return {
-            "timestamp": isostring(self.created),
+            "timestamp": self.created.replace(microsecond=0).isoformat(),
             "up": 1 if self.new_status == "up" else 0,
         }
 
@@ -1149,7 +1150,7 @@ class TokenBucket(models.Model):
         return True
 
     @staticmethod
-    def authorize_auth_ip(request):
+    def authorize_auth_ip(request: HttpRequest) -> bool:
         headers = request.META
         remote_addr = headers.get("HTTP_X_FORWARDED_FOR", headers["REMOTE_ADDR"])
         remote_addr = remote_addr.split(",")[0]
@@ -1177,14 +1178,14 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 20, 3600)
 
     @staticmethod
-    def authorize_invite(user):
+    def authorize_invite(user: User) -> bool:
         value = "invite-%d" % user.id
 
         # 20 invites per day
         return TokenBucket.authorize(value, 20, 3600 * 24)
 
     @staticmethod
-    def authorize_login_password(email):
+    def authorize_login_password(email: str) -> bool:
         salted_encoded = (email + settings.SECRET_KEY).encode()
         value = "pw-%s" % hashlib.sha1(salted_encoded).hexdigest()
 
@@ -1192,7 +1193,7 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 20, 3600 * 24)
 
     @staticmethod
-    def authorize_telegram(telegram_id: str) -> bool:
+    def authorize_telegram(telegram_id: int) -> bool:
         value = "tg-%s" % telegram_id
 
         # 6 messages for a single chat per minute:
@@ -1207,7 +1208,7 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 6, 60)
 
     @staticmethod
-    def authorize_signal_verification(user):
+    def authorize_signal_verification(user: User) -> bool:
         value = "signal-verify-%d" % user.id
 
         # 50 signal recipient verifications per day
@@ -1221,14 +1222,14 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 6, 60)
 
     @staticmethod
-    def authorize_sudo_code(user):
+    def authorize_sudo_code(user: User) -> bool:
         value = "sudo-%d" % user.id
 
         # 10 sudo attempts per day
         return TokenBucket.authorize(value, 10, 3600 * 24)
 
     @staticmethod
-    def authorize_totp_attempt(user):
+    def authorize_totp_attempt(user: User) -> bool:
         value = "totp-%d" % user.id
 
         # 96 attempts per user per 24 hours
@@ -1236,7 +1237,7 @@ class TokenBucket(models.Model):
         return TokenBucket.authorize(value, 96, 3600 * 24)
 
     @staticmethod
-    def authorize_totp_code(user, code):
+    def authorize_totp_code(user: User, code: str) -> bool:
         value = "totpc-%d-%s" % (user.id, code)
 
         # A code has a validity period of 3 * 30 = 90 seconds.
