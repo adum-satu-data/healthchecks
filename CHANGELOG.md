@@ -1,7 +1,24 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
-## v3.0-dev - Unreleased
+## v3.1-dev - Unreleased
+
+### Improvements
+- Update logging configuration to write logs to database (to table `logs_record`)
+- Update the Splunk On-Call integration to not retry HTTP 404 responses
+
+## v3.0.1 - 2023-10-30
+
+### Bug Fixes
+- Fix sending test notification to a group integration
+- Fix the Login form to not perform form validation in GET requests
+- Fix special character escaping in ntfy notifications
+- Fix "Edit ntfy integration" page to fill the existing token in the form
+- Fix "Delete Check" and "Update Check" API calls to handle concurrent deletes
+- Fix Signal transport to handle JSON-RPC messages with no ids
+- Fix DST handling in Check.get_grace_start()
+
+## v3.0 - 2023-10-16
 
 This release drops support of Python 3.9 and below. The minimum required Python
 version is 3.10.
@@ -15,11 +32,17 @@ version is 3.10.
 - Add support for ntfy access tokens (#879)
 - Improve ntfy notifications (include tags, period, last ping type etc.)
 - Add an "Account closed." confirmation message after closing an account
+- Add monthly uptime percentage display in Check Details page (#773)
+- Increase the precision of calculated downtime duration in check's details and reports
+- Increase bottom margin for modal windows to work around Mobile Safari issue (#899)
+- New integration: notification group (#894)
 
 ### Bug Fixes
 - Fix "senddeletionnotices" to recognize "Supporter" subscriptions
 - Fix "createsuperuser" to reject already registered email addresses (#880)
 - Fix hc.accounts.views.check_token to handle non-UUID usernames (#882)
+- Fix time interval formatting in Check Details page, downtime summary table
+- Fix HTML escaping issue in Project admin
 
 ## v2.10 - 2023-07-02
 

@@ -6,12 +6,12 @@ from unittest.mock import Mock, patch
 from django.test.utils import override_settings
 
 from hc.api.models import Channel
-from hc.test import BaseTestCase
+from hc.test import BaseTestCase, nolog
 
 
 @override_settings(SLACK_CLIENT_ID="fake-client-id")
 class AddSlackCompleteTestCase(BaseTestCase):
-    @patch("hc.front.views.curl.post")
+    @patch("hc.front.views.curl.post", autospec=True)
     def test_it_handles_oauth_response(self, mock_post: Mock) -> None:
         session = self.client.session
         session["add_slack"] = ("foo", str(self.project.code))
@@ -31,7 +31,7 @@ class AddSlackCompleteTestCase(BaseTestCase):
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(url, follow=True)
         self.assertRedirects(r, self.channels_url)
-        self.assertContains(r, "The Slack integration has been added!")
+        self.assertContains(r, "Success, integration added!")
 
         ch = Channel.objects.get()
         self.assertEqual(ch.slack_team, "foo")
@@ -53,7 +53,8 @@ class AddSlackCompleteTestCase(BaseTestCase):
         r = self.client.get(url)
         self.assertEqual(r.status_code, 403)
 
-    @patch("hc.front.views.curl.post")
+    @nolog
+    @patch("hc.front.views.curl.post", autospec=True)
     def test_it_handles_oauth_error(self, mock_post: Mock) -> None:
         session = self.client.session
         session["add_slack"] = ("foo", str(self.project.code))
@@ -69,7 +70,30 @@ class AddSlackCompleteTestCase(BaseTestCase):
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(url, follow=True)
         self.assertRedirects(r, self.channels_url)
-        self.assertContains(r, "something went wrong")
+        self.assertContains(r, "Received an unexpected response from Slack")
+
+    @nolog
+    @patch("hc.front.views.logger")
+    @patch("hc.front.views.curl.post", autospec=True)
+    def test_it_handles_unexpected_oauth_response(
+        self, mock_post: Mock, logger: Mock
+    ) -> None:
+        session = self.client.session
+        session["add_slack"] = ("foo", str(self.project.code))
+        session.save()
+
+        oauth_response = "surprise"
+
+        mock_post.return_value.text = json.dumps(oauth_response)
+        mock_post.return_value.json.return_value = oauth_response
+
+        url = "/integrations/add_slack_btn/?code=12345678&state=foo"
+
+        self.client.login(username="alice@example.org", password="password")
+        r = self.client.get(url, follow=True)
+        self.assertRedirects(r, self.channels_url)
+        self.assertContains(r, "Received an unexpected response from Slack")
+        self.assertTrue(logger.warning.called)
 
     @override_settings(SLACK_CLIENT_ID=None)
     def test_it_requires_client_id(self) -> None:

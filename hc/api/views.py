@@ -12,7 +12,7 @@ from uuid import UUID
 from cronsim import CronSim, CronSimError
 from django.conf import settings
 from django.core.signing import BadSignature
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Prefetch
 from django.http import (
     Http404,
@@ -430,6 +430,8 @@ def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpRespons
 
 @authorize
 def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -439,21 +441,34 @@ def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
     except ValidationError as e:
         return JsonResponse({"error": format_first_error(e)}, status=400)
 
-    try:
-        _update(check, spec, request.v)
-    except BadChannelException as e:
-        return JsonResponse({"error": e.message}, status=400)
+    # Start a transaction, select for update, update.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        try:
+            _update(check, spec, request.v)
+        except BadChannelException as e:
+            return JsonResponse({"error": e.message}, status=400)
 
     return JsonResponse(check.to_dict(v=request.v))
 
 
 @authorize
 def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    check.lock_and_delete()
+    # Start a transaction, select for update, delete.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        check.delete()
+
     return JsonResponse(check.to_dict(v=request.v))
 
 

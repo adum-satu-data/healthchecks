@@ -184,22 +184,28 @@ class CheckModelTestCase(BaseTestCase):
         check.created = datetime(2019, 1, 1, tzinfo=timezone.utc)
         check.save()
 
-        nov, dec, jan = check.downtimes(3, "UTC")
-
-        # Nov. 2019
-        self.assertEqual(nov[0].strftime("%m-%Y"), "11-2019")
-        self.assertEqual(nov[1], td())
-        self.assertEqual(nov[2], 0)
-
-        # Dec. 2019
-        self.assertEqual(dec[0].strftime("%m-%Y"), "12-2019")
-        self.assertEqual(dec[1], td())
-        self.assertEqual(dec[2], 0)
+        jan, dec, nov = check.downtimes(3, "UTC")
 
         # Jan. 2020
-        self.assertEqual(jan[0].strftime("%m-%Y"), "01-2020")
-        self.assertEqual(jan[1], td())
-        self.assertEqual(jan[2], 0)
+        self.assertEqual(jan.boundary.strftime("%m-%Y"), "01-2020")
+        self.assertEqual(jan.tz, "UTC")
+        self.assertFalse(jan.no_data)
+        self.assertEqual(jan.duration, td())
+        self.assertEqual(jan.count, 0)
+
+        # Dec. 2019
+        self.assertEqual(dec.boundary.strftime("%m-%Y"), "12-2019")
+        self.assertEqual(jan.tz, "UTC")
+        self.assertFalse(jan.no_data)
+        self.assertEqual(dec.duration, td())
+        self.assertEqual(dec.count, 0)
+
+        # Nov. 2019
+        self.assertEqual(nov.boundary.strftime("%m-%Y"), "11-2019")
+        self.assertEqual(jan.tz, "UTC")
+        self.assertFalse(jan.no_data)
+        self.assertEqual(nov.duration, td())
+        self.assertEqual(nov.count, 0)
 
     @patch("hc.api.models.now", MOCK_NOW)
     @patch("hc.lib.date.now", MOCK_NOW)
@@ -208,10 +214,29 @@ class CheckModelTestCase(BaseTestCase):
         check.created = datetime(2019, 1, 1, tzinfo=timezone.utc)
         check.save()
 
-        r = check.downtimes(10, "UTC")
-        self.assertEqual(len(r), 10)
-        for dt, downtime, outages in r:
-            self.assertEqual(outages, 1)
+        records = check.downtimes(10, "UTC")
+        self.assertEqual(len(records), 10)
+
+        self.assertEqual(records[0].count, 1)
+        self.assertEqual(records[0].monthly_uptime(), (31 - 14) / 31)
+
+        for r in records[1:]:
+            self.assertEqual(r.count, 1)
+            self.assertEqual(r.monthly_uptime(), 0.0)
+
+    @patch("hc.api.models.now", MOCK_NOW)
+    @patch("hc.lib.date.now", MOCK_NOW)
+    def test_monthly_uptime_pct_handles_dst(self) -> None:
+        check = Check(project=self.project, status="down")
+        check.created = datetime(2019, 1, 1, tzinfo=timezone.utc)
+        check.save()
+
+        records = check.downtimes(10, "Europe/Riga")
+        self.assertEqual(len(records), 10)
+
+        for r in records[1:]:
+            self.assertEqual(r.count, 1)
+            self.assertEqual(r.monthly_uptime(), 0.0)
 
     @patch("hc.api.models.now", MOCK_NOW)
     @patch("hc.lib.date.now", MOCK_NOW)
@@ -225,16 +250,16 @@ class CheckModelTestCase(BaseTestCase):
         flip.new_status = "down"
         flip.save()
 
-        r = check.downtimes(10, "UTC")
-        self.assertEqual(len(r), 10)
-        for dt, downtime, outages in r:
-            assert isinstance(downtime, td)
-            if dt.month == 1:
-                self.assertEqual(downtime.total_seconds(), 86400)
-                self.assertEqual(outages, 1)
+        records = check.downtimes(10, "UTC")
+        self.assertEqual(len(records), 10)
+        for r in records:
+            assert isinstance(r.duration, td)
+            if r.boundary.month == 1:
+                self.assertEqual(r.duration.total_seconds(), 86400)
+                self.assertEqual(r.count, 1)
             else:
-                self.assertEqual(downtime.total_seconds(), 0)
-                self.assertEqual(outages, 0)
+                self.assertEqual(r.duration.total_seconds(), 0)
+                self.assertEqual(r.count, 0)
 
     @patch("hc.api.models.now", MOCK_NOW)
     @patch("hc.lib.date.now", MOCK_NOW)
@@ -250,21 +275,25 @@ class CheckModelTestCase(BaseTestCase):
 
         r = check.downtimes(3, "UTC")
         self.assertEqual(len(r), 3)
+        jan, dec, nov = r
 
-        dt, duration, outages = r[0]
-        self.assertEqual(dt.isoformat(), "2019-11-01T00:00:00+00:00")
-        self.assertEqual(duration, td(days=16))
-        self.assertEqual(outages, 1)
+        self.assertEqual(jan.boundary.isoformat(), "2020-01-01T00:00:00+00:00")
+        self.assertFalse(jan.no_data)
+        self.assertEqual(jan.duration, td(days=14))
+        self.assertEqual(jan.monthly_uptime(), (31 - 14) / 31)
+        self.assertEqual(jan.count, 1)
 
-        dt, duration, outages = r[1]
-        self.assertEqual(dt.isoformat(), "2019-12-01T00:00:00+00:00")
-        self.assertEqual(duration, td(days=31))
-        self.assertEqual(outages, 1)
+        self.assertEqual(dec.boundary.isoformat(), "2019-12-01T00:00:00+00:00")
+        self.assertFalse(dec.no_data)
+        self.assertEqual(dec.duration, td(days=31))
+        self.assertEqual(dec.monthly_uptime(), 0.0)
+        self.assertEqual(dec.count, 1)
 
-        dt, duration, outages = r[2]
-        self.assertEqual(dt.isoformat(), "2020-01-01T00:00:00+00:00")
-        self.assertEqual(duration, td(days=14))
-        self.assertEqual(outages, 1)
+        self.assertEqual(nov.boundary.isoformat(), "2019-11-01T00:00:00+00:00")
+        self.assertFalse(nov.no_data)
+        self.assertEqual(nov.duration, td(days=16))
+        self.assertEqual(nov.monthly_uptime(), 14 / 30)
+        self.assertEqual(nov.count, 1)
 
     @patch("hc.api.models.now", MOCK_NOW)
     @patch("hc.lib.date.now", MOCK_NOW)
@@ -281,15 +310,22 @@ class CheckModelTestCase(BaseTestCase):
         r = check.downtimes(2, "Europe/Riga")
         self.assertEqual(len(r), 2)
 
-        dt, duration, outages = r[0]
-        self.assertEqual(dt.isoformat(), "2019-12-01T00:00:00+02:00")
-        self.assertEqual(duration, td())
-        self.assertEqual(outages, 0)
+        jan, dec = r
 
-        dt, duration, outages = r[1]
-        self.assertEqual(dt.isoformat(), "2020-01-01T00:00:00+02:00")
-        self.assertEqual(duration, td(days=14, hours=1))
-        self.assertEqual(outages, 1)
+        self.assertEqual(jan.boundary.isoformat(), "2020-01-01T00:00:00+02:00")
+        self.assertEqual(jan.tz, "Europe/Riga")
+        self.assertFalse(jan.no_data)
+        self.assertEqual(jan.duration, td(days=14, hours=1))
+        total_hours = 31 * 24
+        up_hours = total_hours - 14 * 24 - 1
+        self.assertEqual(jan.monthly_uptime(), up_hours / total_hours)
+        self.assertEqual(jan.count, 1)
+
+        self.assertEqual(dec.boundary.isoformat(), "2019-12-01T00:00:00+02:00")
+        self.assertEqual(dec.tz, "Europe/Riga")
+        self.assertFalse(dec.no_data)
+        self.assertEqual(dec.duration, td())
+        self.assertEqual(dec.count, 0)
 
     @patch("hc.api.models.now", MOCK_NOW)
     @patch("hc.lib.date.now", MOCK_NOW)
@@ -298,19 +334,16 @@ class CheckModelTestCase(BaseTestCase):
         check.created = datetime(2020, 1, 1, 9, tzinfo=timezone.utc)
         check.save()
 
-        nov, dec, jan = check.downtimes(3, "UTC")
-
-        # Nov. 2019
-        self.assertIsNone(nov[1])
-        self.assertIsNone(nov[2])
-
-        # Dec. 2019
-        self.assertIsNone(dec[1])
-        self.assertIsNone(dec[2])
+        jan, dec, nov = check.downtimes(3, "UTC")
 
         # Jan. 2020
-        self.assertEqual(jan[1], td())
-        self.assertEqual(jan[2], 0)
+        self.assertFalse(jan.no_data)
+
+        # Dec. 2019
+        self.assertTrue(dec.no_data)
+
+        # Nov. 2019
+        self.assertTrue(nov.no_data)
 
     @override_settings(S3_BUCKET=None)
     def test_it_prunes(self) -> None:
@@ -342,3 +375,30 @@ class CheckModelTestCase(BaseTestCase):
         code, upto_n = remove_objects.call_args.args
         self.assertEqual(code, str(check.code))
         self.assertEqual(upto_n, 1)
+
+    def test_get_grace_start_returns_utc(self) -> None:
+        check = Check(project=self.project)
+        check.kind = "cron"
+        check.schedule = "15 * * * *"
+        check.tz = "Europe/Riga"
+        check.last_ping = datetime(2023, 10, 29, 0, 55, tzinfo=timezone.utc)
+        check.status = "up"
+
+        gs = check.get_grace_start()
+        assert gs
+        self.assertEqual(gs.tzinfo, timezone.utc)
+
+    def test_get_status_handles_autumn_dst_transition(self) -> None:
+        check = Check(project=self.project)
+        check.kind = "cron"
+        check.schedule = "15 * * * *"
+        check.grace = td(minutes=5)
+        check.tz = "Europe/Riga"
+        check.last_ping = datetime(2023, 10, 29, 0, 55, tzinfo=timezone.utc)
+        check.status = "up"
+
+        with patch("hc.api.models.now") as mock_now:
+            mock_now.return_value = datetime(2023, 10, 29, 1, 5, tzinfo=timezone.utc)
+            # The next expected run time is at 2023-10-29 01:15 UTC, so the check
+            # should still be up for 10 minutes:
+            self.assertEqual(check.get_status(), "up")

@@ -42,7 +42,7 @@ class NotifyNtfyTestCase(BaseTestCase):
         self.channel.save()
         self.channel.checks.add(self.check)
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_works(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -60,7 +60,45 @@ class NotifyNtfyTestCase(BaseTestCase):
         self.assertEqual(payload["actions"][0]["url"], self.check.cloaked_url())
         self.assertNotIn("All the other checks are up.", payload["message"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_it_reports_last_pings_exit_code(self, mock_post: Mock) -> None:
+        mock_post.return_value.status_code = 200
+
+        self.ping.kind = "fail"
+        self.ping.exitstatus = 123
+        self.ping.save()
+
+        self.channel.notify(self.check)
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertIn("Last Ping: Exit status 123", payload["message"])
+
+    @patch("hc.api.transports.curl.request", autospec=True)
+    def test_it_does_not_escape_special_characters(self, mock_post: Mock) -> None:
+        mock_post.return_value.status_code = 200
+
+        self.project.name = "<Alice's Project> "
+        self.project.save()
+
+        self.check.name = "<Name>"
+        self.check.tags = "<foo>"
+        self.check.save()
+
+        other = Check(project=self.project)
+        other.name = "<Foobar>"
+        other.status = "down"
+        other.last_ping = now() - td(minutes=61)
+        other.save()
+
+        self.channel.notify(self.check)
+
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["title"], "<Name> is DOWN")
+        self.assertIn("Project: <Alice's Project>", payload["message"])
+        self.assertIn("Tags: <foo>", payload["message"])
+        self.assertIn("<Foobar>", payload["message"])
+
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_shows_schedule_and_tz(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -73,7 +111,7 @@ class NotifyNtfyTestCase(BaseTestCase):
         self.assertIn("Schedule: * * * * *", payload["message"])
         self.assertIn("Time Zone: Europe/Riga", payload["message"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_shows_all_other_checks_up_note(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -88,7 +126,7 @@ class NotifyNtfyTestCase(BaseTestCase):
         payload = mock_post.call_args.kwargs["json"]
         self.assertIn("All the other checks are up.", payload["message"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_lists_other_down_checks(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -104,7 +142,7 @@ class NotifyNtfyTestCase(BaseTestCase):
         self.assertIn("The following checks are also down", payload["message"])
         self.assertIn("Foobar", payload["message"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_does_not_show_more_than_10_other_checks(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -121,7 +159,7 @@ class NotifyNtfyTestCase(BaseTestCase):
         self.assertNotIn("Foobar", payload["message"])
         self.assertIn("11 other checks are also down.", payload["message"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_uses_access_token(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 

@@ -5,10 +5,9 @@ import re
 from datetime import datetime
 from datetime import timedelta as td
 from datetime import timezone
-from urllib.parse import quote, urlencode
+from typing import Any
 
 from django import forms
-from django.conf import settings
 from django.core.exceptions import ValidationError
 
 from hc.front.validators import (
@@ -16,7 +15,7 @@ from hc.front.validators import (
     TimezoneValidator,
     WebhookValidator,
 )
-from hc.lib import curl
+from hc.lib import matrix
 
 
 def _is_latin1(s: str) -> bool:
@@ -265,27 +264,10 @@ class AddMatrixForm(forms.Form):
         assert isinstance(v, str)
 
         # validate it by trying to join
-        assert settings.MATRIX_HOMESERVER
-        url = settings.MATRIX_HOMESERVER
-        url += "/_matrix/client/r0/join/%s?" % quote(v)
-        url += urlencode({"access_token": settings.MATRIX_ACCESS_TOKEN})
-        r = curl.post(url, {})
-        if r.status_code == 429:
-            raise forms.ValidationError(
-                "Matrix server returned status code 429 (Too Many Requests), "
-                "please try again later."
-            )
-        if r.status_code == 502:
-            raise forms.ValidationError(
-                "Matrix server returned status code 502 (Bad Gateway), "
-                "please try again later."
-            )
-
-        doc = r.json()
-        if "error" in doc:
-            raise forms.ValidationError("Response from Matrix: %s" % doc["error"])
-
-        self.cleaned_data["room_id"] = doc["room_id"]
+        try:
+            self.cleaned_data["room_id"] = matrix.join(v)
+        except matrix.JoinError as e:
+            raise forms.ValidationError(e.message)
 
         return v
 
@@ -333,6 +315,24 @@ class AddGotifyForm(forms.Form):
 
     def get_value(self) -> str:
         return json.dumps(dict(self.cleaned_data), sort_keys=True)
+
+
+class GroupForm(forms.Form):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        project = kwargs.pop("project")
+        super().__init__(*args, **kwargs)
+
+        assert isinstance(self.fields["channels"], forms.MultipleChoiceField)
+        self.fields["channels"].choices = (
+            (c.code, c) for c in project.channel_set.exclude(kind="group")
+        )
+
+    error_css_class = "has-error"
+    label = forms.CharField(max_length=100, required=False)
+    channels = forms.MultipleChoiceField()
+
+    def get_value(self) -> str:
+        return ",".join(self.cleaned_data["channels"])
 
 
 class NtfyForm(forms.Form):

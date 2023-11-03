@@ -11,11 +11,16 @@ termination.
 
 * Copy `/docker/.env.example` to `/docker/.env` and add your configuration in it.
   As a minimum, set the following fields:
-    * `DEFAULT_FROM_EMAIL` – the "From:" address for outbound emails
-    * `EMAIL_HOST` – the SMTP server
-    * `EMAIL_HOST_PASSWORD` – the SMTP password
-    * `EMAIL_HOST_USER` – the SMTP username
-    * `SECRET_KEY` – secures HTTP sessions, set to a random value
+    * `ALLOWED_HOSTS` – the domain name of your Healthchecks instance.
+    Example: `ALLOWED_HOSTS=hc.example.org`.
+    * `DEFAULT_FROM_EMAIL` – the "From:" address for outbound emails.
+    * `EMAIL_HOST` – the SMTP server.
+    * `EMAIL_HOST_PASSWORD` – the SMTP password.
+    * `EMAIL_HOST_USER` – the SMTP username.
+    * `SECRET_KEY` – secures HTTP sessions, set to a random value.
+    * `SITE_ROOT` – The base public URL of your Healthchecks instance. Example:
+    `SITE_ROOT=https://hc.example.org`.
+
 * Create and start containers:
 
   ```sh
@@ -39,19 +44,40 @@ variables in `docker/.env`. For example, to disable HTTP request logging, set:
 
     UWSGI_DISABLE_LOGGING=1
 
+To adjust the number of uWSGI processes (for example, to save memory), set:
+
+    UWSGI_PROCESSES=2
+
 Read more about configuring uWSGI in [uWSGI documentation](https://uwsgi-docs.readthedocs.io/en/latest/Configuration.html#environment-variables).
+
+## SMTP Listener Configuration via `SMTPD_PORT`
+
+Healthchecks comes with a `smtpd` management command, which runs a SMTP listener
+service. With the command running, you can ping your checks by sending email messages
+to `your-uuid-here@your-hc-domain.com` email addresses.
+
+The container is configured to start the SMTP listener conditionally, based
+on the value of the `SMTPD_PORT` environment value:
+
+* If `SMTPD_PORT` environment variable is not set, the SMTP listener will not run.
+* If `SMTPD_PORT` is set, the listener will run and listen on the specified port.
+  You may also need to edit `docker-compose.yml` to expose the listening port
+  (see the "ports" section under the "web" service in `docker-compose.yml`).
+
+The conditional logic lives in uWSGI configuration file,
+[uwsgi.ini](https://github.com/healthchecks/healthchecks/blob/master/docker/uwsgi.ini).
 
 ## TLS Termination
 
 If you plan to expose your Healthchecks instance to the public internet, make sure you
 put a TLS-terminating reverse proxy or load balancer in front of it.
 
-**Important:** This Dockerfile uses UWSGI, which relies on the [X-Forwarded-Proto](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-Proto)
+**Important:** This Dockerfile uses uWSGI, which relies on the [X-Forwarded-Proto](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-Proto)
 header to determine if a request is secure or not. Make sure your TLS-terminating
 reverse proxy:
 
-* Discards the X-Forwarded-Proto header sent by the end user.
-* Sets the X-Forwarded-Proto header value to match the protocol of the original request
+* Discards the `X-Forwarded-Proto` header sent by the end user.
+* Sets the `X-Forwarded-Proto` header value to match the protocol of the original request
   ("http" or "https").
 
 For example, in NGINX you can use the `$scheme` variable like so:
@@ -78,3 +104,10 @@ The Docker images:
 * Do *not* handle TLS termination. In a production setup, you will want to put
   the Healthchecks container behind a reverse proxy or load balancer that handles TLS
   termination.
+
+To use a pre-built image for Healthchecks version X.Y, in the `docker-compose.yml` file
+replace the "build" section with:
+
+```text
+image: healthchecks/healthchecks:vX.Y
+```

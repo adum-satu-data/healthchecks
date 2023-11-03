@@ -11,6 +11,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import django_stubs_ext
+
+django_stubs_ext.monkeypatch()
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -62,6 +65,7 @@ INSTALLED_APPS = (
     "compressor",
     "hc.api",
     "hc.front",
+    "hc.logs",
     "hc.payments",
 )
 
@@ -111,23 +115,21 @@ TEMPLATES = [
     }
 ]
 
-# Extend Django logging to log unhandled exceptions to console even when DEBUG=False
+# Extend Django logging to log unhandled exceptions
+# and all logs from hc.* loggers to the database.
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "filters": {
-        "require_debug_false": {
-            "()": "django.utils.log.RequireDebugFalse",
-        },
-    },
     "handlers": {
-        "console_debug_false": {
-            "level": "ERROR",
-            "class": "logging.StreamHandler",
-            "filters": ["require_debug_false"],
+        "db": {
+            "level": "DEBUG",
+            "class": "hc.logs.Handler",
         },
     },
-    "loggers": {"django.request": {"handlers": ["console_debug_false"]}},
+    "loggers": {
+        "django.request": {"level": "ERROR", "handlers": ["db"]},
+        "hc": {"level": "DEBUG", "handlers": ["db"]},
+    },
 }
 
 WSGI_APPLICATION = "hc.wsgi.application"
@@ -213,7 +215,7 @@ COMPRESS_FILTERS = {
 }
 
 
-def immutable_file_test(path, url):
+def immutable_file_test(path: Any, url: str) -> bool:
     return "/static/CACHE/" in url or "/static/fonts/" in url
 
 

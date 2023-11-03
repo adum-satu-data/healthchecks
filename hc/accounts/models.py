@@ -240,12 +240,15 @@ class Profile(models.Model):
                 boundaries = month_boundaries(3, self.tz)
 
             for check in checks:
-                setattr(
-                    check,
-                    "past_downtimes",
-                    check.downtimes_by_boundary(boundaries)[:-1],
-                )
+                downtimes = check.downtimes_by_boundary(boundaries, self.tz)
+                # downtimes_by_boundary returns records in descending order,
+                # but the template will need them in ascending order:
+                downtimes.reverse()
+                setattr(check, "past_downtimes", downtimes[:-1])
 
+            # boundaries are in descending order, but the template
+            # will need them in ascending order:
+            boundaries.reverse()
             ctx["checks"] = checks
             ctx["boundaries"] = boundaries[:-1]
             ctx["monthly_or_weekly"] = self.reports

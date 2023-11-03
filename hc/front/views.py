@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -12,7 +13,7 @@ from datetime import datetime
 from datetime import timedelta as td
 from email.message import EmailMessage
 from secrets import token_urlsafe
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 from urllib.parse import urlencode, urlparse
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -24,7 +25,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core import signing
 from django.core.exceptions import PermissionDenied
-from django.db.models import Count, F, QuerySet
+from django.db.models import Case, Count, F, QuerySet, When
 from django.http import (
     Http404,
     HttpRequest,
@@ -39,7 +40,9 @@ from django.urls import reverse
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from hc.accounts.http import AuthenticatedHttpRequest
 from hc.accounts.models import Member, Profile, Project
 from hc.api.models import (
     DEFAULT_GRACE,
@@ -54,17 +57,17 @@ from hc.api.models import (
 from hc.api.transports import Signal, Telegram, TransportError
 from hc.front import forms
 from hc.front.decorators import require_setting
-from hc.front.schemas import telegram_callback
 from hc.front.templatetags.hc_extras import (
     down_title,
     num_down_title,
     site_hostname,
     sortchecks,
 )
-from hc.lib import curl, jsonschema
+from hc.lib import curl
 from hc.lib.badges import get_badge_url
-from hc.lib.typealias import AuthenticatedHttpRequest
 from hc.lib.tz import all_timezones
+
+logger = logging.getLogger(__name__)
 
 VALID_SORT_VALUES = ("name", "-name", "last_ping", "-last_ping", "created")
 STATUS_TEXT_TMPL = get_template("front/log_status_text.html")
@@ -198,7 +201,7 @@ def _get_referer_qs(request: HttpRequest) -> str:
 
 
 @login_required
-def my_checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+def checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     _refresh_last_active_date(request.profile)
     project, rw = _get_project_for_user(request, code)
 
@@ -222,7 +225,10 @@ def my_checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     pairs = list(tags_statuses.items())
     pairs.sort(key=lambda pair: pair[0].lower())
 
-    channels = list(project.channel_set.order_by("created"))
+    is_group = Case(When(kind="group", then=0), default=1)
+    channels = project.channel_set.annotate(is_group=is_group)
+    # Sort groups first, then in the creation order
+    channels = channels.order_by("is_group", "created")
 
     hidden_checks = set()
     # Hide checks that don't match selected tags:
@@ -275,7 +281,7 @@ def my_checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         "show_last_duration": show_last_duration,
     }
 
-    return render(request, "front/my_checks.html", ctx)
+    return render(request, "front/checks.html", ctx)
 
 
 @login_required
@@ -900,7 +906,12 @@ def details(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         check.project.show_slugs = request.GET["urls"] == "slug"
         check.project.save()
 
-    channels = list(check.project.channel_set.order_by("created"))
+    all_channels = check.project.channel_set.order_by("created")
+    regular_channels: list[Channel] = []
+    group_channels: list[Channel] = []
+    for channel in all_channels:
+        channels = group_channels if channel.kind == "group" else regular_channels
+        channels.append(channel)
 
     all_tags = set()
     q = Check.objects.filter(project=check.project).exclude(tags="")
@@ -912,7 +923,8 @@ def details(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         "project": check.project,
         "check": check,
         "rw": rw,
-        "channels": channels,
+        "channels": regular_channels,
+        "group_channels": group_channels,
         "enabled_channels": list(check.channel_set.all()),
         "timezones": all_timezones,
         "downtimes": check.downtimes(settings.CUSTOM_VIEW_DOWNTIMES_COUNT, request.profile.tz),
@@ -1095,9 +1107,10 @@ def channels(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         channel.checks.set(new_checks)
         return redirect("hc-channels", project.code)
 
-    channels = Channel.objects.filter(project=project)
-    channels = channels.order_by("created")
-    channels = channels.annotate(n_checks=Count("checks"))
+    channels = project.channel_set.annotate(n_checks=Count("checks"))
+    # Sort groups first, then in the creation order
+    channels = channels.annotate(is_group=Case(When(kind="group", then=0), default=1))
+    channels = channels.order_by("is_group", "created")
 
     ctx = {
         "page": "channels",
@@ -1312,16 +1325,18 @@ def edit_channel(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     channel = _get_rw_channel_for_user(request, code)
     if channel.kind == "email":
         return email_form(request, channel)
-    if channel.kind == "webhook":
+    elif channel.kind == "webhook":
         return webhook_form(request, channel)
-    if channel.kind == "sms":
+    elif channel.kind == "sms":
         return sms_form(request, channel)
-    if channel.kind == "signal":
+    elif channel.kind == "signal":
         return signal_form(request, channel)
-    if channel.kind == "whatsapp":
+    elif channel.kind == "whatsapp":
         return whatsapp_form(request, channel)
-    if channel.kind == "ntfy":
+    elif channel.kind == "ntfy":
         return ntfy_form(request, channel)
+    elif channel.kind == "group":
+        return group_form(request, channel)
 
     return HttpResponseBadRequest()
 
@@ -1568,16 +1583,20 @@ def add_slack_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     result = curl.post("https://slack.com/api/oauth.v2.access", data)
 
     doc = result.json()
-    if doc.get("ok"):
-        channel = Channel(kind="slack", project=project)
-        channel.value = result.text
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Slack integration has been added!")
-    else:
-        s = doc.get("error")
-        messages.warning(request, "Error message from slack: %s" % s)
+    if not isinstance(doc, dict) or not doc.get("ok"):
+        messages.warning(
+            request,
+            "Received an unexpected response from Slack. Integration not added.",
+        )
+        logger.warning("Unexpected Slack OAuth response: %s", result.content)
+        return redirect("hc-channels", project.code)
 
+    channel = Channel(kind="slack", project=project)
+    channel.value = result.text
+    channel.save()
+    channel.assign_all_checks()
+
+    messages.success(request, "Success, integration added!")
     return redirect("hc-channels", project.code)
 
 
@@ -1658,6 +1677,10 @@ def add_pushbullet(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
     return render(request, "integrations/add_pushbullet.html", ctx)
 
 
+class PushbulletOAuthResponse(BaseModel):
+    access_token: str
+
+
 @require_setting("PUSHBULLET_CLIENT_ID")
 @login_required
 def add_pushbullet_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
@@ -1682,17 +1705,21 @@ def add_pushbullet_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
         "grant_type": "authorization_code",
     }
     result = curl.post("https://api.pushbullet.com/oauth2/token", data)
+    try:
+        doc = PushbulletOAuthResponse.model_validate_json(result.content, strict=True)
+    except ValidationError:
+        logger.warning("Unexpected Pushbullet OAuth response: %s", result.content)
+        messages.warning(
+            request,
+            "Received an unexpected response from Pushbullet. Integration not added.",
+        )
+        return redirect("hc-channels", project.code)
 
-    doc = result.json()
-    if "access_token" in doc:
-        channel = Channel(kind="pushbullet", project=project)
-        channel.value = doc["access_token"]
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Pushbullet integration has been added!")
-    else:
-        messages.warning(request, "Something went wrong")
-
+    channel = Channel(kind="pushbullet", project=project)
+    channel.value = doc.access_token
+    channel.save()
+    channel.assign_all_checks()
+    messages.success(request, "The Pushbullet integration has been added!")
     return redirect("hc-channels", project.code)
 
 
@@ -1744,15 +1771,19 @@ def add_discord_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     result = curl.post("https://discordapp.com/api/oauth2/token", data)
 
     doc = result.json()
-    if "access_token" in doc:
-        channel = Channel(kind="discord", project=project)
-        channel.value = result.text
-        channel.save()
-        channel.assign_all_checks()
-        messages.success(request, "The Discord integration has been added!")
-    else:
-        messages.warning(request, "Something went wrong.")
+    if not isinstance(doc, dict) or "access_token" not in doc:
+        messages.warning(
+            request,
+            "Received an unexpected response from Discord. Integration not added.",
+        )
+        logger.warning("Unexpected Discord OAuth response: %s", result.content)
+        return redirect("hc-channels", project.code)
 
+    channel = Channel(kind="discord", project=project)
+    channel.value = result.text
+    channel.save()
+    channel.assign_all_checks()
+    messages.success(request, "The Discord integration has been added!")
     return redirect("hc-channels", project.code)
 
 
@@ -1893,34 +1924,54 @@ def add_zulip(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     return render(request, "integrations/add_zulip.html", ctx)
 
 
+class TelegramChat(BaseModel):
+    id: int
+    type: Literal["group", "private", "supergroup", "channel"]
+    title: str | None = None
+    username: str | None = None
+
+
+class TelegramMessage(BaseModel):
+    chat: TelegramChat
+    text: str
+    message_thread_id: int | None = None
+
+
+class TelegramCallback(BaseModel):
+    message: TelegramMessage
+
+    @classmethod
+    def load(self, data: bytes) -> TelegramCallback:
+        doc = json.loads(data.decode())
+        if "channel_post" in doc:
+            # Telegram's "channel_post" key uses the same structure as "message".
+            # To keep the validation and view logic simple, if the payload
+            # contains "channel_post", copy it to "message", and proceed as usual.
+            doc["message"] = doc["channel_post"]
+        return TelegramCallback.model_validate(doc, strict=True)
+
+
 @csrf_exempt
 @require_POST
 def telegram_bot(request: HttpRequest) -> HttpResponse:
     try:
-        doc = json.loads(request.body.decode())
-        if "channel_post" in doc:
-            # Telegram's "channel_post" key uses the same structure as "message".
-            # To keep the JSON schema and the view logic simple, if the payload
-            # contains "channel_post", copy it to "message", and proceed as usual.
-            doc["message"] = doc["channel_post"]
-
-        jsonschema.validate(doc, telegram_callback)
-    except ValueError:
-        return HttpResponseBadRequest()
-    except jsonschema.ValidationError:
+        doc = TelegramCallback.load(request.body)
+    except ValidationError:
         # We don't recognize the message format, but don't want Telegram
         # retrying this over and over again, so respond with 200 OK
         return HttpResponse()
+    except ValueError:
+        return HttpResponseBadRequest()
 
-    if "/start" not in doc["message"]["text"]:
+    if "/start" not in doc.message.text:
         return HttpResponse()
 
-    chat = doc["message"]["chat"]
+    chat = doc.message.chat
     recipient = {
-        "id": chat["id"],
-        "type": chat["type"],
-        "name": chat.get("title") or chat.get("username"),
-        "thread_id": doc["message"].get("message_thread_id"),
+        "id": chat.id,
+        "type": chat.type,
+        "name": chat.title or chat.username,
+        "thread_id": doc.message.message_thread_id,
     }
 
     invite = render_to_string(
@@ -1929,7 +1980,7 @@ def telegram_bot(request: HttpRequest) -> HttpResponse:
     )
 
     try:
-        Telegram.send(recipient["id"], recipient["thread_id"], invite)
+        Telegram.send(chat.id, doc.message.message_thread_id, invite)
     except TransportError:
         # Swallow the error and return HTTP 200 OK, otherwise Telegram will
         # hit the webhook again and again.
@@ -2228,13 +2279,28 @@ def add_apprise(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     return render(request, "integrations/add_apprise.html", ctx)
 
 
+class TrelloList(BaseModel):
+    id: str
+    name: str
+
+
+class TrelloBoard(BaseModel):
+    id: str
+    name: str
+    lists: list[TrelloList]
+
+
+TrelloBoards = TypeAdapter(list[TrelloBoard])
+
+
 @require_setting("TRELLO_APP_KEY")
 @login_required
 @require_POST
 def trello_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
-    token = request.POST.get("token")
+    token = request.POST.get("token", "")
 
     url = "https://api.trello.com/1/members/me/boards"
+    assert settings.TRELLO_APP_KEY
     params = {
         "key": settings.TRELLO_APP_KEY,
         "token": token,
@@ -2244,9 +2310,14 @@ def trello_settings(request: AuthenticatedHttpRequest) -> HttpResponse:
         "list_fields": "id,name",
     }
 
-    boards = curl.get(url, params=params).json()
-    num_lists = sum(len(board["lists"]) for board in boards)
+    result = curl.get(url, params)
+    try:
+        boards = TrelloBoards.validate_json(result.content)
+    except ValidationError:
+        logger.warning("Unexpected Trello API response: %s", result.content)
+        return render(request, "integrations/trello_settings.html", {"error": 1})
 
+    num_lists = sum(len(board.lists) for board in boards)
     ctx = {"token": token, "boards": boards, "num_lists": num_lists}
     return render(request, "integrations/trello_settings.html", ctx)
 
@@ -2389,6 +2460,15 @@ def add_linenotify(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
     return render(request, "integrations/add_linenotify.html", ctx)
 
 
+class LineTokenResponse(BaseModel):
+    status: Literal[200]
+    access_token: str
+
+
+class LineStatusResponse(BaseModel):
+    target: str
+
+
 @require_setting("LINENOTIFY_CLIENT_ID")
 @login_required
 def add_linenotify_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
@@ -2414,22 +2494,27 @@ def add_linenotify_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
         "client_secret": settings.LINENOTIFY_CLIENT_SECRET,
     }
     result = curl.post("https://notify-bot.line.me/oauth/token", data)
-
-    doc = result.json()
-    if doc.get("status") != 200:
-        messages.warning(request, "Something went wrong.")
+    try:
+        tr = LineTokenResponse.model_validate_json(result.content, strict=True)
+        token = tr.access_token
+    except ValidationError:
+        messages.warning(request, "Received an unexpected response from LINE Notify.")
+        logger.warning("Unexpected LINE OAuth response: %s", result.content)
         return redirect("hc-channels", project.code)
 
     # Fetch notification target's name, will use it as channel name:
-    token = doc["access_token"]
-    result = curl.get(
-        "https://notify-api.line.me/api/status",
-        headers={"Authorization": "Bearer %s" % token},
-    )
-    doc = result.json()
+    headers = {"Authorization": f"Bearer {token}"}
+    result = curl.get("https://notify-api.line.me/api/status", headers=headers)
+    try:
+        sr = LineStatusResponse.model_validate_json(result.content, strict=True)
+        target = sr.target
+    except ValidationError:
+        messages.warning(request, "Received an unexpected response from LINE Notify.")
+        logger.warning("Unexpected LINE Status response: %s", result.content)
+        return redirect("hc-channels", project.code)
 
     channel = Channel(kind="linenotify", project=project)
-    channel.name = doc.get("target")
+    channel.name = target
     channel.value = token
     channel.save()
     channel.assign_all_checks()
@@ -2458,6 +2543,38 @@ def add_gotify(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     return render(request, "integrations/add_gotify.html", ctx)
 
 
+def group_form(request: HttpRequest, channel: Channel) -> HttpResponse:
+    adding = channel._state.adding
+    if request.method == "POST":
+        form = forms.GroupForm(request.POST, project=channel.project)
+        if form.is_valid():
+            channel.name = form.cleaned_data["label"]
+            channel.value = form.get_value()
+            channel.save()
+
+            if adding:
+                channel.assign_all_checks()
+            return redirect("hc-channels", channel.project.code)
+    elif adding:
+        form = forms.GroupForm(project=channel.project)
+    else:
+        # Filter out unavailable channels
+        channels = list(channel.group_channels.values_list("code", flat=True))
+        form = forms.GroupForm(
+            {"channels": channels, "label": channel.name}, project=channel.project
+        )
+
+    ctx = {"page": "channels", "project": channel.project, "form": form}
+    return render(request, "integrations/group_form.html", ctx)
+
+
+@login_required
+def add_group(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    project = _get_rw_project_for_user(request, code)
+    channel = Channel(project=project, kind="group")
+    return group_form(request, channel)
+
+
 def ntfy_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     adding = channel._state.adding
     if request.method == "POST":
@@ -2474,10 +2591,11 @@ def ntfy_form(request: HttpRequest, channel: Channel) -> HttpResponse:
     else:
         form = forms.NtfyForm(
             {
-                "topic": channel.ntfy_topic,
-                "url": channel.ntfy_url,
-                "priority": channel.ntfy_priority,
-                "priority_up": channel.ntfy_priority_up,
+                "topic": channel.ntfy.topic,
+                "url": channel.ntfy.url,
+                "priority": channel.ntfy.priority,
+                "priority_up": channel.ntfy.priority_up,
+                "token": channel.ntfy.token,
             }
         )
 

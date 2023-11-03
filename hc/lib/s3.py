@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 from threading import Thread
+from typing import cast
+from uuid import UUID
 
 from django.conf import settings
 from statsd.defaults.env import statsd
@@ -74,7 +76,7 @@ def get_object(code: str, n: int) -> bytes | None:
         response = None
         try:
             response = client().get_object(settings.S3_BUCKET, key)
-            return response.read()
+            return cast(bytes, response.read())
         except S3Error as e:
             if e.code == "NoSuchKey":
                 # It's not an error condition if an object does not exist.
@@ -94,7 +96,7 @@ def get_object(code: str, n: int) -> bytes | None:
                 response.release_conn()
 
 
-def put_object(code, n: int, data: bytes) -> None:
+def put_object(code: UUID, n: int, data: bytes) -> None:
     key = "%s/%s" % (code, enc(n))
     retries = 10
     while True:
@@ -110,7 +112,7 @@ def put_object(code, n: int, data: bytes) -> None:
             raise e
 
 
-def _remove_objects(code, upto_n):
+def _remove_objects(code: UUID, upto_n: int) -> None:
     if upto_n <= 0:
         return
 
@@ -125,9 +127,9 @@ def _remove_objects(code, upto_n):
                 errors = client().remove_objects(settings.S3_BUCKET, delete_objs)
                 for e in errors:
                     statsd.incr("hc.lib.s3.removeObjectsErrors")
-                    logger.error(f"remove_objects error: {e}")
+                    logger.error("remove_objects error: %s", e)
         except ReadTimeoutError:
-            logger.exception(f"ReadTimeoutError while removing {num_objs} objects")
+            logger.exception("ReadTimeoutError while removing %d objects", num_objs)
             statsd.incr("hc.lib.s3.removeObjectsErrors")
 
 

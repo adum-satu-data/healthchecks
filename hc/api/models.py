@@ -4,6 +4,7 @@ import hashlib
 import json
 import socket
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from datetime import timedelta as td
 from datetime import timezone
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 from hc.accounts.models import Project
 from hc.api import transports
 from hc.lib import emails
-from hc.lib.date import month_boundaries
+from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import get_object, put_object, remove_objects
 
 STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused"))
@@ -44,6 +45,7 @@ TRANSPORTS: dict[str, tuple[str, type[transports.Transport]]] = {
     "discord": ("Discord", transports.Discord),
     "email": ("Email", transports.Email),
     "gotify": ("Gotify", transports.Gotify),
+    "group": ("Group", transports.Group),
     "hipchat": ("HipChat", transports.RemovedTransport),
     "linenotify": ("LINE Notify", transports.LineNotify),
     "matrix": ("Matrix", transports.Matrix),
@@ -130,21 +132,43 @@ class CheckDict(TypedDict, total=False):
     tz: str
 
 
-class DowntimeSummary(object):
-    def __init__(self, boundaries: list[datetime]) -> None:
-        self.boundaries = list(sorted(boundaries, reverse=True))
-        self.durations = [td() for _ in boundaries]
-        self.counts = [0 for _ in boundaries]
+@dataclass
+class DowntimeRecord:
+    boundary: datetime  # The start of this time interval (timezone-aware)
+    tz: str  # For calculating total seconds in a month
+    no_data: bool  # True if the check did not yet exist in this time interval
+    duration: td  # Total downtime in this time interval
+    count: int  # The number of downtime events in this time interval
+
+    def monthly_uptime(self) -> float:
+        # NB: this method assumes monthly boundaries.
+        # It will yield incorrect results for weekly boundaries
+        max_seconds = seconds_in_month(self.boundary.date(), self.tz)
+        up_seconds = max_seconds - self.duration.total_seconds()
+        return up_seconds / max_seconds
+
+
+class DowntimeRecorder(object):
+    def __init__(self, boundaries: list[datetime], tz: str, created: datetime) -> None:
+        """
+        `boundaries` is a list of timezone-aware datetimes of the starts of time
+        intervals (months or weeks), and should be pre-sorted in descending order.
+        """
+        self.records = []
+        prev_boundary = None
+        for b in boundaries:
+            # If the check was created *after* the start of the previous time
+            # interval then the check did not yet exist during this time interval:
+            no_data = prev_boundary is not None and created > prev_boundary
+            self.records.append(DowntimeRecord(b, tz, no_data, td(), 0))
+            prev_boundary = b
 
     def add(self, when: datetime, duration: td) -> None:
-        for i in range(0, len(self.boundaries)):
-            if when >= self.boundaries[i]:
-                self.durations[i] += duration
-                self.counts[i] += 1
+        for record in self.records:
+            if when >= record.boundary:
+                record.duration += duration
+                record.count += 1
                 return
-
-    def as_tuples(self) -> zip[tuple[datetime, td, int]]:
-        return zip(self.boundaries, self.durations, self.counts)
 
 
 class Check(models.Model):
@@ -253,6 +277,11 @@ class Check(models.Model):
             # DST transitions). cronsim will handle the timezone-aware datetimes.
             last_local = self.last_ping.astimezone(ZoneInfo(self.tz))
             result = next(CronSim(self.schedule, last_local))
+            # Important: convert from the local timezone back to UTC.
+            # If the result is kept in the local timezone, adding
+            # a timedelta to it later (in `going_down_after` and in `get_status`)
+            # may yield incorrect results during DST transitions.
+            result = result.astimezone(timezone.utc)
 
         if with_started and self.last_start and self.status != "down":
             result = min(result, self.last_start)
@@ -486,19 +515,18 @@ class Check(models.Model):
         return self.ping_set.filter(n__gt=threshold)
 
     def downtimes_by_boundary(
-        self, boundaries: list[datetime]
-    ) -> list[tuple[datetime, td | None, int | None]]:
+        self, boundaries: list[datetime], tz: str
+    ) -> list[DowntimeRecord]:
         """Calculate downtime counts and durations for the given time intervals.
 
-        Returns a list of (datetime, downtime_in_secs, number_of_outages) tuples
-        in ascending datetime order.
+        Returns a list of DowntimeRecord instances in descending datetime order.
 
-        `boundaries` are the datetimes of the first days of time intervals
-        (months or weeks) we're interested in, in ascending order.
+        `boundaries` are timezone-aware datetimes of the first days of time intervals
+        (months or weeks), and should be pre-sorted in descending order.
 
         """
 
-        summary = DowntimeSummary(boundaries)
+        summary = DowntimeRecorder(boundaries, tz, self.created)
 
         # A list of flips and time interval boundaries
         events = [(b, "---") for b in boundaries]
@@ -511,32 +539,20 @@ class Check(models.Model):
         dt, status = now(), self.status
         for prev_dt, prev_status in sorted(events, reverse=True):
             if status == "down":
-                summary.add(prev_dt, dt - prev_dt)
+                # Before subtracting datetimes convert them to UTC.
+                # Otherwise we will get incorrect results around DST transitions:
+                delta = dt.astimezone(timezone.utc) - prev_dt.astimezone(timezone.utc)
+                summary.add(prev_dt, delta)
 
             dt = prev_dt
             if prev_status != "---":
                 status = prev_status
 
-        # Convert to a list of tuples and set counters to None
-        # for intervals when the check didn't exist yet
-        prev_boundary = None
-        result: list[tuple[datetime, td | None, int | None]] = []
-        for triple in summary.as_tuples():
-            if prev_boundary and self.created > prev_boundary:
-                result.append((triple[0], None, None))
-                continue
+        return summary.records
 
-            prev_boundary = triple[0]
-            result.append(triple)
-
-        result.sort()
-        return result
-
-    def downtimes(
-        self, months: int, tz: str
-    ) -> list[tuple[datetime, td | None, int | None]]:
+    def downtimes(self, months: int, tz: str) -> list[DowntimeRecord]:
         boundaries = month_boundaries(months, tz)
-        return self.downtimes_by_boundary(boundaries)
+        return self.downtimes_by_boundary(boundaries, tz)
 
     def create_flip(self, new_status: str, mark_as_processed: bool = False) -> None:
         """Create a Flip object for this check.
@@ -679,16 +695,6 @@ class Ping(models.Model):
         return None
 
 
-def json_property(kind: str, field: str) -> property:
-    def fget(instance: Channel) -> int | str:
-        assert instance.kind == kind
-        v = instance.json[field]
-        assert isinstance(v, int) or isinstance(v, str)
-        return v
-
-    return property(fget)
-
-
 class WebhookSpec(BaseModel):
     method: str
     url: str
@@ -746,6 +752,46 @@ class OpsgenieConf(BaseModel):
     region: str
 
 
+class ZulipConf(BaseModel):
+    bot_email: str
+    api_key: str
+    mtype: str
+    to: str
+    site: str = ""
+    topic: str = ""
+
+    def model_post_init(self, context: Any) -> None:
+        if self.site == "":
+            # Fallback if we don't have the site value:
+            # derive it from bot's email
+            _, domain = self.bot_email.split("@")
+            self.site = f"https://{domain}"
+
+
+class NtfyConf(BaseModel):
+    topic: str
+    url: str
+    priority: int
+    priority_up: int
+    token: str = ""
+
+    @property
+    def priority_display(self) -> str:
+        return NTFY_PRIORITIES[self.priority]
+
+
+class TrelloConf(BaseModel):
+    token: str
+    list_id: str
+    board_name: str
+    list_name: str
+
+
+class GotifyConf(BaseModel):
+    url: str
+    token: str
+
+
 class Channel(models.Model):
     name = models.CharField(max_length=100, blank=True)
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
@@ -764,18 +810,18 @@ class Channel(models.Model):
         if self.name:
             return self.name
         if self.kind == "email":
-            return "Email to %s" % self.email.value
+            return f"Email to {self.email.value}"
         elif self.kind == "sms":
-            return "SMS to %s" % self.phone.value
+            return f"SMS to {self.phone.value}"
         elif self.kind == "slack":
-            return "Slack %s" % self.slack_channel
+            return f"Slack {self.slack_channel}"
         elif self.kind == "telegram":
-            return "Telegram %s" % self.telegram.name
+            return f"Telegram {self.telegram.name}"
         elif self.kind == "zulip":
-            if self.zulip_type == "stream":
-                return "Zulip stream %s" % self.zulip_to
-            if self.zulip_type == "private":
-                return "Zulip user %s" % self.zulip_to
+            if self.zulip.mtype == "stream":
+                return f"Zulip stream {self.zulip.to}"
+            if self.zulip.mtype == "private":
+                return f"Zulip user {self.zulip.to}"
 
         return self.get_kind_display()
 
@@ -783,7 +829,15 @@ class Channel(models.Model):
         return {"id": str(self.code), "name": self.name, "kind": self.kind}
 
     def is_editable(self) -> bool:
-        return self.kind in ("email", "webhook", "sms", "signal", "whatsapp", "ntfy")
+        return self.kind in (
+            "email",
+            "webhook",
+            "sms",
+            "signal",
+            "whatsapp",
+            "ntfy",
+            "group",
+        )
 
     def assign_all_checks(self) -> None:
         checks = Check.objects.filter(project=self.project)
@@ -986,14 +1040,10 @@ class Channel(models.Model):
         assert self.kind in ("call", "sms", "whatsapp", "signal")
         return PhoneConf.model_validate_json(self.value)
 
-    trello_token = json_property("trello", "token")
-    trello_list_id = json_property("trello", "list_id")
-
     @property
-    def trello_board_list(self) -> tuple[str, str]:
+    def trello(self) -> TrelloConf:
         assert self.kind == "trello"
-        doc = json.loads(self.value)
-        return doc["board_name"], doc["list_name"]
+        return TrelloConf.model_validate_json(self.value, strict=True)
 
     @property
     def email(self) -> EmailConf:
@@ -1003,49 +1053,31 @@ class Channel(models.Model):
     def opsgenie(self) -> OpsgenieConf:
         return OpsgenieConf.model_validate_json(self.value)
 
-    zulip_bot_email = json_property("zulip", "bot_email")
-    zulip_api_key = json_property("zulip", "api_key")
-    zulip_type = json_property("zulip", "mtype")
-    zulip_to = json_property("zulip", "to")
-
     @property
-    def zulip_site(self) -> str:
-        assert self.kind == "zulip"
-        doc = json.loads(self.value)
-        if "site" in doc:
-            return doc["site"]
-
-        # Fallback if we don't have the site value:
-        # derive it from bot's email
-        _, domain = doc["bot_email"].split("@")
-        return "https://" + domain
-
-    @property
-    def zulip_topic(self) -> str:
-        assert self.kind == "zulip"
-        return self.json.get("topic", "")
+    def zulip(self) -> ZulipConf:
+        return ZulipConf.model_validate_json(self.value)
 
     @property
     def linenotify_token(self) -> str:
         assert self.kind == "linenotify"
         return self.value
 
-    gotify_url = json_property("gotify", "url")
-    gotify_token = json_property("gotify", "token")
-
-    ntfy_topic = json_property("ntfy", "topic")
-    ntfy_url = json_property("ntfy", "url")
-    ntfy_priority = json_property("ntfy", "priority")
-    ntfy_priority_up = json_property("ntfy", "priority_up")
+    @property
+    def gotify(self) -> GotifyConf:
+        assert self.kind == "gotify"
+        return GotifyConf.model_validate_json(self.value, strict=True)
 
     @property
-    def ntfy_token(self) -> str | None:
+    def group_channels(self) -> QuerySet[Channel]:
+        assert self.kind == "group"
+        return Channel.objects.filter(
+            project=self.project, code__in=self.value.split(",")
+        )
+
+    @property
+    def ntfy(self) -> NtfyConf:
         assert self.kind == "ntfy"
-        return self.json.get("token")
-
-    @property
-    def ntfy_priority_display(self) -> str:
-        return NTFY_PRIORITIES[self.ntfy_priority]
+        return NtfyConf.model_validate_json(self.value, strict=True)
 
 
 class Notification(models.Model):

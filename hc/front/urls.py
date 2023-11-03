@@ -63,6 +63,7 @@ project_urls = [
     path("add_discord/", views.add_discord, name="hc-add-discord"),
     path("add_email/", views.add_email, name="hc-add-email"),
     path("add_gotify/", views.add_gotify, name="hc-add-gotify"),
+    path("add_group/", views.add_group, name="hc-add-group"),
     path("add_linenotify/", views.add_linenotify, name="hc-add-linenotify"),
     path("add_matrix/", views.add_matrix, name="hc-add-matrix"),
     path("add_mattermost/", views.add_mattermost, name="hc-add-mattermost"),
@@ -87,7 +88,7 @@ project_urls = [
     path("add_whatsapp/", views.add_whatsapp, name="hc-add-whatsapp"),
     path("add_zulip/", views.add_zulip, name="hc-add-zulip"),
     path("badges/", views.badges, name="hc-badges"),
-    path("checks/", views.my_checks, name="hc-checks"),
+    path("checks/", views.checks, name="hc-checks"),
     path("checks/add/", views.add_check, name="hc-add-check"),
     path(
         "checks/metrics/<slug:key>",

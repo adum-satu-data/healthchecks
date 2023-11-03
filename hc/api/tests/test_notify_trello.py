@@ -35,7 +35,7 @@ class NotifyTrelloTestCase(BaseTestCase):
         self.channel.save()
         self.channel.checks.add(self.check)
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_works(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
@@ -49,7 +49,14 @@ class NotifyTrelloTestCase(BaseTestCase):
         self.assertEqual(params["key"], "fake-trello-app-key")
         self.assertEqual(params["token"], "fake-token")
 
-    @patch("hc.api.transports.curl.request")
+    @override_settings(TRELLO_APP_KEY=None)
+    def test_it_requires_trello_app_key(self) -> None:
+        self.channel.notify(self.check)
+
+        n = Notification.objects.get()
+        self.assertEqual(n.error, "Trello notifications are not enabled.")
+
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_shows_schedule_and_tz(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
         self.check.kind = "cron"
@@ -63,7 +70,7 @@ class NotifyTrelloTestCase(BaseTestCase):
         self.assertIn(f"**Schedule:** `{a} {a} {a} {a} {a}`", params["desc"])
         self.assertIn("**Time Zone:** Europe/Riga", params["desc"])
 
-    @patch("hc.api.transports.curl.request")
+    @patch("hc.api.transports.curl.request", autospec=True)
     def test_it_does_not_escape_name(self, mock_post: Mock) -> None:
         mock_post.return_value.status_code = 200
 
