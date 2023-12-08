@@ -5,7 +5,20 @@ All notable changes to this project will be documented in this file.
 
 ### Improvements
 - Update logging configuration to write logs to database (to table `logs_record`)
-- Update the Splunk On-Call integration to not retry HTTP 404 responses
+- Improve Pushover notifications (include tags, period, last ping type etc.)
+- Implement audo-submit in TOTP entry screen (#905)
+- Update the Splunk On-Call integration to disable channel on HTTP 404 responses
+- Update the Slack integration to disable channel when Slack returns 400 "invalid_token"
+- Update the Pushover integration to disable channel when Pushover reports invalid user
+- Update Twilio integrations to disable channel on "Invalid 'To' Phone Number"
+- Update the Signal integration to disable channel on UNREGISTERED_FAILURE
+- Upgrade to Django 5.0
+- Add support for systemd's OnCalendar schedules (#919)
+
+### Bug Fixes
+- Fix "Ping Details" dialog to handle email bodies not yet uploaded to object storage
+- Fix webauthn registration failure on Firefox with Bitwarden extension
+- Fix webauthn registration failure on Firefox < 119 with Ed25519 keys
 
 ## v3.0.1 - 2023-10-30
 

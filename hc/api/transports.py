@@ -465,13 +465,23 @@ class Slackalike(HttpTransport):
 class Slack(Slackalike):
     @classmethod
     def raise_for_response(cls, response: curl.Response) -> NoReturn:
-        if response.status_code == 400:
-            logger.debug("Slack returned HTTP 400 with body: %s", response.content)
-
         message = f"Received status code {response.status_code}"
-        # If Slack returns 404, this endpoint is unlikely to ever work again
-        # https://api.slack.com/messaging/webhooks#handling_errors
-        permanent = response.status_code == 404
+        permanent = False
+        if response.status_code == 404:
+            # If Slack returns 404, this endpoint is unlikely to ever work again
+            # https://api.slack.com/messaging/webhooks#handling_errors
+            permanent = True
+        elif response.status_code == 400:
+            if response.content == b"invalid_token":
+                # If Slack returns 400 with "invalid_token" in response body,
+                # we're using a deactivated user's token to post to a private channel.
+                # In theory this condition can recover (a deactivated user can be
+                # activated), but in practice it is unlikely to happen.
+                permanent = True
+            else:
+                # Log it for later inspection
+                logger.debug("Slack returned HTTP 400 with body: %s", response.content)
+
         raise TransportError(message, permanent=permanent)
 
     def notify(self, check: Check, notification: Notification) -> None:
@@ -609,6 +619,24 @@ class Pushover(HttpTransport):
     URL = "https://api.pushover.net/1/messages.json"
     CANCEL_TMPL = "https://api.pushover.net/1/receipts/cancel_by_tag/%s.json"
 
+    class ErrorModel(BaseModel):
+        user: str = ""
+
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        message = f"Received status code {response.status_code}"
+        permanent = False
+        if response.status_code == 400:
+            try:
+                doc = Pushover.ErrorModel.model_validate_json(response.content)
+                if doc.user == "invalid":
+                    message += " (invalid user)"
+                    permanent = True
+            except ValidationError:
+                logger.debug("Pushover HTTP 400 with body: %s", response.content)
+
+        raise TransportError(message, permanent=permanent)
+
     def is_noop(self, check: Check) -> bool:
         pieces = self.channel.value.split("|")
         _, prio = pieces[0], pieces[1]
@@ -643,7 +671,11 @@ class Pushover(HttpTransport):
             cancel_payload = {"token": settings.PUSHOVER_API_TOKEN}
             self.post(url, data=cancel_payload)
 
-        ctx = {"check": check, "down_checks": self.down_checks(check)}
+        ctx = {
+            "check": check,
+            "ping": self.last_ping(check),
+            "down_checks": self.down_checks(check),
+        }
         text = tmpl("pushover_message.html", **ctx)
         title = tmpl("pushover_title.html", **ctx)
         prio = up_prio if check.status == "up" else down_prio
@@ -656,6 +688,8 @@ class Pushover(HttpTransport):
             "html": 1,
             "priority": int(prio),
             "tags": check.unique_key,
+            "url": check.cloaked_url(),
+            "url_title": f"View on {settings.SITE_NAME}",
         }
 
         # Emergency notification
@@ -843,6 +877,23 @@ class Telegram(HttpTransport):
 class Sms(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
 
+    class ErrorModel(BaseModel):
+        code: int
+
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = Sms.ErrorModel.model_validate_json(response.content, strict=True)
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("Twilio Messages HTTP 400 with body: %s", response.content)
+
+        raise TransportError(f"Received status code {response.status_code}")
+
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
             return not self.channel.phone.notify_down
@@ -880,6 +931,22 @@ class Sms(HttpTransport):
 class Call(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Calls.json"
 
+    class ErrorModel(BaseModel):
+        code: int
+
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = Call.ErrorModel.model_validate_json(response.content, strict=True)
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("Twilio Calls HTTP 400 with body: %s", response.content)
+        raise TransportError(f"Received status code {response.status_code}")
+
     def is_noop(self, check: Check) -> bool:
         return check.status != "down"
 
@@ -912,6 +979,25 @@ class Call(HttpTransport):
 
 class WhatsApp(HttpTransport):
     URL = "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
+
+    class ErrorModel(BaseModel):
+        code: int
+
+    @classmethod
+    def raise_for_response(cls, response: curl.Response) -> NoReturn:
+        if response.status_code == 400:
+            try:
+                doc = WhatsApp.ErrorModel.model_validate_json(
+                    response.content, strict=True
+                )
+                if doc.code == 21211:
+                    raise TransportError("Invalid phone number", permanent=True)
+            except ValidationError:
+                pass
+
+            logger.debug("WhatsApp HTTP 400 with body: %s", response.content)
+
+        raise TransportError(f"Received status code {response.status_code}")
 
     def is_noop(self, check: Check) -> bool:
         if check.status == "down":
@@ -1182,7 +1268,7 @@ class Signal(Transport):
                     continue
 
                 if result.type == "UNREGISTERED_FAILURE":
-                    raise TransportError("Recipient not found")
+                    raise TransportError("Recipient not found", permanent=True)
 
                 if result.type == "RATE_LIMIT_FAILURE" and result.token:
                     raise SignalRateLimitFailure(result.token, reply_bytes)

@@ -169,9 +169,14 @@
                     <td>
                         <span class="value">{{ check.schedule }}</span>
                     </td>
+                    {% elif check.kind == "oncalendar" %}
+                    <th>OnCalendar Expr.</th>
+                    <td>
+                        <span class="value">{{ check.schedule|linebreaksbr }}</span>
+                    </td>
                     {% endif %}
                 </tr>
-                {% if check.kind == "cron" %}
+                {% if check.kind == "cron" or check.kind == "oncalendar" %}
                 <tr>
                     <th>Time Zone</th>
                     <td>
@@ -299,7 +304,7 @@
                 </label>
                 {% endif %}
 
-                {% if check.kind == "cron" %}
+                {% if check.kind == "cron" or check.kind == "oncalendar" %}
                 <label
                     class="btn btn-default btn-xs active"
                     data-format="{{ check.tz }}">
@@ -309,7 +314,7 @@
                 {% endif %}
 
                 <label
-                    class="btn btn-default btn-xs {% if check.kind != 'cron' %}active{% endif %}"
+                    class="btn btn-default btn-xs {% if check.kind == 'simple' %}active{% endif %}"
                     data-format="local">
                     <input type="radio" name="date-format">
                     Browser's time zone
@@ -382,11 +387,11 @@
 <script src="{% static 'js/moment.min.js' %}"></script>
 <script src="{% static 'js/moment-timezone-with-data-10-year-range.min.js' %}"></script>
 <script src="{% static 'js/purify.min.js' %}"></script>
+<script src="{% static 'js/initialize-timezone-selects.js' %}"></script>
 <script src="{% static 'js/update-timeout-modal.js' %}"></script>
 <script src="{% static 'js/adaptive-setinterval.js' %}"></script>
 <script src="{% static 'js/ping_details.js' %}"></script>
 <script src="{% static 'js/details.js' %}"></script>
-<script src="{% static 'js/initialize-timezone-selects.js' %}"></script>
 <script src="{% static 'js/slug-suggestions.js' %}"></script>
 {% endcompress %}
 {% endblock %}

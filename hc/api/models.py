@@ -23,6 +23,7 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.timezone import now
+from oncalendar import OnCalendar
 from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
@@ -35,7 +36,7 @@ STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused")
 DEFAULT_TIMEOUT = td(days=1)
 DEFAULT_GRACE = td(hours=1)
 NEVER = datetime(3000, 1, 1, tzinfo=timezone.utc)
-CHECK_KINDS = (("simple", "Simple"), ("cron", "Cron"))
+CHECK_KINDS = (("simple", "Simple"), ("cron", "Cron"), ("oncalendar", "OnCalendar"))
 # max time between start and ping where we will consider both events related:
 MAX_DURATION = td(hours=72)
 
@@ -282,6 +283,11 @@ class Check(models.Model):
             # a timedelta to it later (in `going_down_after` and in `get_status`)
             # may yield incorrect results during DST transitions.
             result = result.astimezone(timezone.utc)
+        elif self.kind == "oncalendar" and self.status == "up":
+            assert self.last_ping is not None
+            last_local = self.last_ping.astimezone(ZoneInfo(self.tz))
+            result = next(OnCalendar(self.schedule, last_local))
+            result = result.astimezone(timezone.utc)
 
         if with_started and self.last_start and self.status != "down":
             result = min(result, self.last_start)
@@ -402,7 +408,7 @@ class Check(models.Model):
 
         if self.kind == "simple":
             result["timeout"] = int(self.timeout.total_seconds())
-        elif self.kind == "cron":
+        elif self.kind in ("cron", "oncalendar"):
             result["schedule"] = self.schedule
             result["tz"] = self.tz
 
