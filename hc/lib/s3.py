@@ -28,6 +28,7 @@ def client() -> Minio:
 
     global _client
     if _client is None:
+        assert settings.S3_ENDPOINT
         _client = Minio(
             settings.S3_ENDPOINT,
             settings.S3_ACCESS_KEY,
@@ -97,6 +98,7 @@ def get_object(code: str, n: int) -> bytes | None:
 
 
 def put_object(code: UUID, n: int, data: bytes) -> None:
+    assert settings.S3_BUCKET
     key = "%s/%s" % (code, enc(n))
     retries = 10
     while True:
@@ -113,6 +115,7 @@ def put_object(code: UUID, n: int, data: bytes) -> None:
 
 
 def _remove_objects(code: UUID, upto_n: int) -> None:
+    assert settings.S3_BUCKET
     if upto_n <= 0:
         return
 
@@ -133,10 +136,13 @@ def _remove_objects(code: UUID, upto_n: int) -> None:
             statsd.incr("hc.lib.s3.removeObjectsErrors")
 
 
-def remove_objects(check_code: str, upto_n: int) -> None:
+def remove_objects(check_code: str, upto_n: int, wait: bool = False) -> None:
     """Remove keys with n values below or equal to `upto_n`.
 
     The S3 API calls can take seconds to complete,
     therefore run the removal code on thread.
     """
-    Thread(target=_remove_objects, args=(check_code, upto_n)).start()
+    t = Thread(target=_remove_objects, args=(check_code, upto_n))
+    t.start()
+    if wait:
+        t.join()

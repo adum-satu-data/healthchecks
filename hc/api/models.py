@@ -286,8 +286,12 @@ class Check(models.Model):
         elif self.kind == "oncalendar" and self.status == "up":
             assert self.last_ping is not None
             last_local = self.last_ping.astimezone(ZoneInfo(self.tz))
-            result = next(OnCalendar(self.schedule, last_local))
-            result = result.astimezone(timezone.utc)
+            try:
+                result = next(OnCalendar(self.schedule, last_local))
+                # Same as for cron, convert back to UTC:
+                result = result.astimezone(timezone.utc)
+            except StopIteration:
+                result = NEVER
 
         if with_started and self.last_start and self.status != "down":
             result = min(result, self.last_start)
@@ -320,7 +324,10 @@ class Check(models.Model):
             return self.status
 
         grace_start = self.get_grace_start(with_started=False)
-        assert grace_start is not None
+        if grace_start is None:
+            # next elapse is "never", so this check will stay up indefinitely
+            return "up"
+
         grace_end = grace_start + self.grace
         if frozen_now >= grace_end:
             return "down"
@@ -497,20 +504,23 @@ class Check(models.Model):
         if self.n_pings % 100 == 0:
             self.prune()
 
-    def prune(self) -> None:
+    def prune(self, wait: bool = False) -> None:
         """Remove old pings and notifications."""
 
         threshold = self.n_pings - self.project.owner_profile.ping_log_limit
 
         # Remove ping bodies from object storage
         if settings.S3_BUCKET:
-            remove_objects(str(self.code), threshold)
+            remove_objects(str(self.code), threshold, wait=wait)
 
         # Remove ping objects from db
         self.ping_set.filter(n__lte=threshold).delete()
 
         try:
-            ping = self.ping_set.earliest("id")
+            # Important: sort by "created", not by "id". Sorting by id
+            # may cause Postgres to use the "api_ping_pkey" index, and scan
+            # a huge number of rows.
+            ping = self.ping_set.earliest("created")
             self.notification_set.filter(created__lt=ping.created).delete()
         except Ping.DoesNotExist:
             pass

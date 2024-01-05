@@ -1,7 +1,19 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
-## v3.1-dev - Unreleased
+## v3.2-dev - Unreleased
+
+### Improvements
+- Update Opsgenie instructions
+- Update Spike.sh instructions
+- Add system check to validate settings.SITE_ROOT (#895)
+
+### Bug Fixes
+- Increase uWSGI buffer size to allow requests with large cookies (#925)
+- Fix crash when processing one-shot OnCalendar schedules
+- Fix the handling of ping bodies > 2.5MB (#931)
+
+## v3.1 - 2023-12-13
 
 ### Improvements
 - Update logging configuration to write logs to database (to table `logs_record`)
