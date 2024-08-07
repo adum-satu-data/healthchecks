@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import Mock, patch
 
 from django.test.utils import override_settings
 
 from hc.api.models import Channel
-from hc.test import BaseTestCase, nolog
+from hc.test import BaseTestCase
 
 
 @override_settings(DISCORD_CLIENT_ID="t1", DISCORD_CLIENT_SECRET="s1")
@@ -41,11 +42,25 @@ class AddDiscordCompleteTestCase(BaseTestCase):
         # Session should now be clean
         self.assertFalse("add_discord" in self.client.session)
 
-    @nolog
+    @patch("hc.front.views.curl.post", autospec=True)
+    def test_it_handles_code_30007(self, mock_post: Mock) -> None:
+        oauth_response = {"code": 30007}
+        mock_post.return_value.text = json.dumps(oauth_response)
+        mock_post.return_value.json.return_value = oauth_response
+
+        session = self.client.session
+        session["add_discord"] = ("foo", str(self.project.code))
+        session.save()
+
+        self.client.login(username="alice@example.org", password="password")
+        r = self.client.get(self.url + "?code=12345678&state=foo", follow=True)
+        self.assertRedirects(r, self.channels_url)
+        self.assertContains(r, "maximum number of webhooks")
+
     @patch("hc.front.views.curl.post", autospec=True)
     def test_it_handles_unexpected_oauth_response(self, mock_post: Mock) -> None:
-        for sample in ("surprise", {}, None):
-            oauth_response = "surprise"
+        oauth_response: Any
+        for oauth_response in ("surprise", {}, None):
             mock_post.return_value.text = json.dumps(oauth_response)
             mock_post.return_value.json.return_value = oauth_response
 

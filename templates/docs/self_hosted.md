@@ -9,7 +9,7 @@ Healthchecks instance yourself.
 The building blocks are:
 
 * Python 3.10+
-* Django 4
+* Django 5
 * PostgreSQL or MySQL
 
 ## Setting Up for Development
@@ -137,7 +137,7 @@ Within an activated virtualenv, run the `sendalerts` command like so:
 In a production setup, make sure the `sendalerts` command can survive
 server restarts.
 
-## Database Cleanup
+## Database Cleanup {: #database-cleanup }
 
 With time and use, the Healthchecks database will grow in size. You may
 decide to prune old data: inactive user accounts, old checks not assigned

@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import datetime
 from datetime import timedelta as td
@@ -25,7 +25,8 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core import signing
 from django.core.exceptions import PermissionDenied
-from django.db.models import Case, Count, F, QuerySet, When
+from django.db.models import Case, Count, F, Q, QuerySet, When
+from django.db.models.functions import Substr
 from django.http import (
     Http404,
     HttpRequest,
@@ -40,6 +41,7 @@ from django.urls import reverse
 from django.utils.timezone import now
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from django_stubs_ext import WithAnnotations
 from oncalendar import OnCalendar, OnCalendarError
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
@@ -51,6 +53,7 @@ from hc.api.models import (
     MAX_DURATION,
     Channel,
     Check,
+    Flip,
     Notification,
     Ping,
     TokenBucket,
@@ -77,25 +80,32 @@ EVENTS_TMPL = get_template("front/details_events.html")
 DOWNTIMES_TMPL = get_template("front/details_downtimes.html")
 
 
-def _tags_statuses(checks: Iterable[Check]) -> tuple[dict[str, str], int]:
-    tags, down, grace, num_down = {}, {}, {}, 0
+def _tags_counts(checks: Iterable[Check]) -> tuple[list[tuple[str, str, str]], int]:
+    num_down = 0
+    grace = set()
+    counts: Counter[str] = Counter()
+    down_counts: Counter[str] = Counter()
     for check in checks:
         status = check.get_status()
-
+        counts.update(check.tags_list())
         if status == "down":
             num_down += 1
-            for tag in check.tags_list():
-                down[tag] = "down"
+            down_counts.update(check.tags_list())
         elif status == "grace":
-            for tag in check.tags_list():
-                grace[tag] = "grace"
-        else:
-            for tag in check.tags_list():
-                tags[tag] = "up"
+            grace.update(check.tags_list())
 
-    tags.update(grace)
-    tags.update(down)
-    return tags, num_down
+    result = []
+    for tag in counts:
+        if tag in down_counts:
+            status = "down"
+            text = f"{down_counts[tag]} of {counts[tag]} down"
+        else:
+            status = "grace" if tag in grace else "up"
+            text = f"{counts[tag]} up"
+
+        result.append((tag, status, text))
+
+    return result, num_down
 
 
 def _get_check_for_user(
@@ -222,9 +232,8 @@ def checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     checks = list(q.prefetch_related("channel_set"))
     sortchecks(checks, request.profile.sort)
 
-    tags_statuses, num_down = _tags_statuses(checks)
-    pairs = list(tags_statuses.items())
-    pairs.sort(key=lambda pair: pair[0].lower())
+    tags_counts, num_down = _tags_counts(checks)
+    tags_counts.sort(key=lambda item: item[0].lower())
 
     is_group = Case(When(kind="group", then=0), default=1)
     channels = project.channel_set.annotate(is_group=is_group)
@@ -269,7 +278,7 @@ def checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
         "checks": checks,
         "channels": channels,
         "num_down": num_down,
-        "tags": pairs,
+        "tags": tags_counts,
         "ping_endpoint": settings.PING_ENDPOINT,
         "timezones": all_timezones,
         "project": project,
@@ -302,9 +311,10 @@ def status(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
             }
         )
 
-    tags_statuses, num_down = _tags_statuses(checks)
+    tags_counts, num_down = _tags_counts(checks)
+    tags = {tag: (status, tooltip) for tag, status, tooltip in tags_counts}
     return JsonResponse(
-        {"details": details, "tags": tags_statuses, "title": num_down_title(num_down)}
+        {"details": details, "tags": tags, "title": num_down_title(num_down)}
     )
 
 
@@ -365,9 +375,12 @@ def index(request: HttpRequest) -> HttpResponse:
     q = q.annotate(n_channels=Count("channel", distinct=True))
     q = q.annotate(owner_email=F("owner__email"))
     projects = list(q)
+    any_down = False
     for project in projects:
         setattr(project, "overall_status", summary[project.code]["status"])
         setattr(project, "any_started", summary[project.code]["started"])
+        if summary[project.code]["status"] == "down":
+            any_down = True
 
     # The list returned by projects() is already sorted . Do an additional sorting pass
     # to move projects with overall_status=down to the front (without changing their
@@ -378,6 +391,7 @@ def index(request: HttpRequest) -> HttpResponse:
         "page": "projects",
         "projects": projects,
         "last_project_id": request.session.get("last_project_id"),
+        "any_down": any_down,
     }
 
     return render(request, "front/projects.html", ctx)
@@ -473,7 +487,9 @@ def docs_search(request: HttpRequest) -> HttpResponse:
         LIMIT 8
     """
 
-    q = form.cleaned_data["q"]
+    # Wrap the query in double quotes to get a valid FTS string
+    # https://www.sqlite.org/fts5.html#full_text_query_syntax
+    q = '"%s"' % form.cleaned_data["q"]
     con = sqlite3.connect(settings.BASE_DIR / "search.db")
     cur = con.cursor()
     res = cur.execute(query, (q,))
@@ -578,7 +594,7 @@ def update_timeout(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
         check.kind = "cron"
         check.schedule = cron_form.cleaned_data["schedule"]
         check.tz = cron_form.cleaned_data["tz"]
-        check.grace = td(minutes=cron_form.cleaned_data["grace"])
+        check.grace = cron_form.cleaned_data["grace"]
     elif kind == "oncalendar":
         oncalendar_form = forms.OnCalendarForm(request.POST)
         if not oncalendar_form.is_valid():
@@ -587,7 +603,7 @@ def update_timeout(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
         check.kind = "oncalendar"
         check.schedule = oncalendar_form.cleaned_data["schedule"]
         check.tz = oncalendar_form.cleaned_data["tz"]
-        check.grace = td(minutes=oncalendar_form.cleaned_data["grace"])
+        check.grace = oncalendar_form.cleaned_data["grace"]
 
     check.alert_after = check.going_down_after()
     if check.status == "up":
@@ -834,20 +850,34 @@ def clear_events(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     return redirect("hc-details", code)
 
 
+class PingAnnotations(TypedDict):
+    body_raw_preview: bytes
+
+
 def _get_events(
     check: Check,
     page_limit: int,
-    start: datetime | None = None,
-    end: datetime | None = None,
-) -> list[Notification | Ping]:
+    start: datetime,
+    end: datetime,
+    kinds: tuple[str, ...] | None = None,
+) -> list[Notification | WithAnnotations[Ping, PingAnnotations] | Flip]:
     # Sorting by "n" instead of "id" is important here. Both give the same
     # query results, but sorting by "id" can cause postgres to pick
     # api_ping.id index (slow if the api_ping table is big). Sorting by
     # "n" works around the problem--postgres picks the api_ping.owner_id index.
     pq = check.visible_pings.order_by("-n")
-    if start and end:
-        pq = pq.filter(created__gte=start, created__lte=end)
+    pq = pq.filter(created__gte=start, created__lte=end)
+    if kinds is not None:
+        kinds_filter = Q(kind__in=kinds)
+        if "success" in kinds:
+            kinds_filter = kinds_filter | Q(kind__isnull=True) | Q(kind="")
+        pq = pq.filter(kinds_filter)
 
+    # Optimization: defer loading body_raw, instead load its first 150 bytes
+    # as "body_raw_preview". This reduces both network I/O to database, and disk I/O
+    # on the database host if the database contains large request bodies.
+    pq = pq.defer("body_raw")
+    pq = pq.annotate(body_raw_preview=Substr("body_raw", 1, 151))
     pings = list(pq[:page_limit])
 
     # Optimization: the template will access Ping.duration, which would generate a
@@ -866,10 +896,10 @@ def _get_events(
                 num_misses += 1
             else:
                 ping.duration = None
-                start = starts[ping.rid]
-                if start is not None:
-                    if ping.created - start < MAX_DURATION:
-                        ping.duration = ping.created - start
+                matching_start = starts[ping.rid]
+                if matching_start is not None:
+                    if ping.created - matching_start < MAX_DURATION:
+                        ping.duration = ping.created - matching_start
 
             starts[ping.rid] = None
 
@@ -879,63 +909,52 @@ def _get_events(
         for ping in pings:
             ping.duration = None
 
-    alerts: list[Notification]
-    q = Notification.objects.select_related("channel")
-    q = q.filter(owner=check, check_status="down")
-    if start and end:
-        q = q.filter(created__gte=start, created__lte=end)
-        alerts = list(q)
-    elif len(pings):
-        cutoff = pings[-1].created
-        q = q.filter(created__gt=cutoff)
-        alerts = list(q)
-    else:
-        alerts = []
+    alerts: list[Notification] = []
+    if kinds and "notification" in kinds:
+        aq = check.notification_set.order_by("-created")
+        aq = aq.filter(created__gte=start, created__lte=end, check_status="down")
+        aq = aq.select_related("channel")
+        alerts = list(aq[:page_limit])
 
-    events = pings + alerts
-    events.sort(key=lambda el: el.created, reverse=True)
-    return events
+    flips: list[Flip] = []
+    if kinds is None or "flip" in kinds:
+        fq = check.flip_set.order_by("-created")
+        fq = fq.filter(created__gte=start, created__lte=end)
+        flips = list(fq[:page_limit])
+
+    events = pings + alerts + flips
+    # Sort events by the timestamp.
+    # If timestamps are equal, put flips chronologically after pings
+    events.sort(key=lambda el: (el.created, isinstance(el, Flip)), reverse=True)
+    return events[:page_limit]
 
 
 @login_required
 def log(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
 
+    smin = check.created
     smax = now()
-    smin = smax - td(hours=24)
-
     oldest_ping = check.visible_pings.order_by("n").first()
     if oldest_ping:
-        smin = min(smin, oldest_ping.created)
+        smin = max(smin, oldest_ping.created)
 
-    # Align slider steps to full hours
-    smin = smin.replace(minute=0, second=0)
-
-    form = forms.SeekForm(request.GET)
-    if form.is_valid():
-        start = form.cleaned_data["start"]
-        end = form.cleaned_data["end"]
-    else:
-        start, end = smin, smax
-
-    # Clamp the _get_events start argument to the date of the oldest visible ping
-    get_events_start = start
-    if oldest_ping and oldest_ping.created > get_events_start:
-        get_events_start = oldest_ping.created
-
-    total = check.visible_pings.filter(created__gte=start, created__lte=end).count()
-    events = _get_events(check, 1000, start=get_events_start, end=end)
+    events = _get_events(check, 1000, start=smin, end=smax)
     ctx = {
         "page": "log",
         "project": check.project,
         "check": check,
         "min": smin,
         "max": smax,
-        "start": start,
-        "end": end,
         "events": events,
-        "num_total": total,
+        "oldest_ping": oldest_ping,
     }
+
+    if events:
+        # A full precision timestamp of the most recent event.
+        # This will be used client-side for fetching live updates to specify
+        # "return any events after *this* point".
+        ctx["last_event_timestamp"] = events[0].created.timestamp()
 
     return render(request, "front/log.html", ctx)
 
@@ -1060,7 +1079,7 @@ def status_single(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse
     check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
 
     status = check.get_status()
-    events = _get_events(check, 20)
+    events = _get_events(check, 30, start=check.created, end=now())
     updated = "1"
     if len(events):
         updated = str(events[0].created.timestamp())
@@ -1087,35 +1106,49 @@ def status_single(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse
 def badges(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     project, rw = _get_project_for_user(request, code)
 
+    if request.method == "POST":
+        form = forms.BadgeSettingsForm(request.POST)
+        if not form.is_valid():
+            return HttpResponseBadRequest()
+
+        fmt = form.cleaned_data["fmt"]
+        states = form.cleaned_data["states"]
+        with_late = True if states == "3" else False
+        if form.cleaned_data["target"] == "all":
+            label = settings.MASTER_BADGE_LABEL
+            url = get_badge_url(project.badge_key, "*", fmt, with_late)
+        elif form.cleaned_data["target"] == "tag":
+            label = form.cleaned_data["tag"]
+            url = get_badge_url(project.badge_key, label, fmt, with_late)
+        elif form.cleaned_data["target"] == "check":
+            check = project.check_set.get(code=form.cleaned_data["check"])
+            url = settings.SITE_ROOT + reverse(
+                "hc-badge-check", args=[states, check.prepare_badge_key(), fmt]
+            )
+            label = check.name_then_code()
+
+        if fmt == "shields":
+            url = "https://img.shields.io/endpoint?" + urlencode({"url": url})
+
+        ctx = {"fmt": fmt, "label": label, "url": url}
+        return render(request, "front/badges_preview.html", ctx)
+
+    checks = list(project.check_set.order_by("name"))
     tags = set()
-    for check in Check.objects.filter(project=project):
+    for check in checks:
         tags.update(check.tags_list())
 
     sorted_tags = sorted(tags, key=lambda s: s.lower())
-    sorted_tags.append("*")  # For the "overall status" badge
-
-    key = project.badge_key
-    urls = []
-    for tag in sorted_tags:
-        urls.append(
-            {
-                "tag": tag,
-                "svg": get_badge_url(key, tag),
-                "svg3": get_badge_url(key, tag, with_late=True),
-                "json": get_badge_url(key, tag, fmt="json"),
-                "json3": get_badge_url(key, tag, fmt="json", with_late=True),
-                "shields": get_badge_url(key, tag, fmt="shields"),
-                "shields3": get_badge_url(key, tag, fmt="shields", with_late=True),
-            }
-        )
 
     ctx = {
-        "have_tags": len(urls) > 1,
-        "page": "badges",
         "project": project,
-        "badges": urls,
+        "page": "badges",
+        "checks": checks,
+        "tags": sorted_tags,
+        "fmt": "svg",
+        "label": settings.MASTER_BADGE_LABEL,
+        "url": get_badge_url(project.badge_key, "*"),
     }
-
     return render(request, "front/badges.html", ctx)
 
 
@@ -1198,8 +1231,7 @@ def channel_checks(request: AuthenticatedHttpRequest, code: UUID) -> HttpRespons
     channel = _get_rw_channel_for_user(request, code)
 
     assigned = set(channel.checks.values_list("code", flat=True).distinct())
-    checks = Check.objects.filter(project=channel.project).order_by("created")
-
+    checks = channel.project.check_set.order_by("created")
     ctx = {"checks": checks, "assigned": assigned, "channel": channel}
 
     return render(request, "front/channel_checks.html", ctx)
@@ -1274,16 +1306,22 @@ def send_test_notification(
     dummy.last_ping = now() - td(days=1)
     dummy.n_pings = 42
 
+    dummy_flip = Flip(owner=dummy)
+    dummy_flip.created = now()
+    dummy_flip.old_status = "up"
+    dummy_flip.new_status = "down"
+
     # Delete all older test notifications for this channel
     Notification.objects.filter(channel=channel, owner=None).delete()
 
     # Send the test notification
-    error = channel.notify(dummy, is_test=True)
+    error = channel.notify(dummy_flip, is_test=True)
 
     if error == "no-op":
         # This channel may be configured to send "up" notifications only.
-        dummy.status = "up"
-        error = channel.notify(dummy, is_test=True)
+        dummy_flip.old_status = "down"
+        dummy_flip.new_status = "up"
+        error = channel.notify(dummy_flip, is_test=True)
 
     if error:
         messages.warning(request, "Could not send a test notification. %s." % error)
@@ -1636,6 +1674,8 @@ def add_slack_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
 
     channel = Channel(kind="slack", project=project)
     channel.value = result.text
+    if channel.slack_channel:
+        channel.name = channel.slack_channel
     channel.save()
     channel.assign_all_checks()
 
@@ -1814,6 +1854,11 @@ def add_discord_complete(request: AuthenticatedHttpRequest) -> HttpResponse:
     result = curl.post("https://discordapp.com/api/oauth2/token", data)
 
     doc = result.json()
+    if isinstance(doc, dict) and doc.get("code") == 30007:
+        e = "maximum number of webhooks reached"
+        messages.warning(request, f"Response from Discord: {e}. Integration not added.")
+        return redirect("hc-channels", project.code)
+
     if not isinstance(doc, dict) or "access_token" not in doc:
         messages.warning(
             request,
@@ -2373,7 +2418,7 @@ def add_msteams(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
     if request.method == "POST":
         form = forms.AddUrlForm(request.POST)
         if form.is_valid():
-            channel = Channel(project=project, kind="msteams")
+            channel = Channel(project=project, kind="msteamsw")
             channel.value = form.cleaned_data["value"]
             channel.save()
 
@@ -2433,14 +2478,20 @@ def metrics(request: HttpRequest, code: UUID, key: str) -> HttpResponse:
             value = 1 if check.last_start is not None else 0
             yield TMPL % (esc(check.name), esc(check.tags), check.unique_key, value)
 
-        tags_statuses, num_down = _tags_statuses(checks)
+        all_tags, down_tags, num_down = set(), set(), 0
+        for check in checks:
+            all_tags.update(check.tags_list())
+            if check.get_status() == "down":
+                num_down += 1
+                down_tags.update(check.tags_list())
+
         yield "\n"
         help = "Whether all checks with this tag are up (1 for yes, 0 for no)."
         yield f"# HELP hc_tag_up {help}\n"
         yield "# TYPE hc_tag_up gauge\n"
         TMPL = """hc_tag_up{tag="%s"} %d\n"""
-        for tag in sorted(tags_statuses):
-            value = 0 if tags_statuses[tag] == "down" else 1
+        for tag in sorted(all_tags):
+            value = 0 if tag in down_tags else 1
             yield TMPL % (esc(tag), value)
 
         yield "\n"
@@ -2715,6 +2766,38 @@ def verify_signal_number(request: AuthenticatedHttpRequest) -> HttpResponse:
 
     # Success!
     return render_result(None)
+
+
+@login_required
+def log_events(request: AuthenticatedHttpRequest, code: UUID) -> HttpResponse:
+    check, rw = _get_check_for_user(request, code, preload_owner_profile=True)
+    form = forms.LogFiltersForm(request.GET)
+    if not form.is_valid():
+        return HttpResponseBadRequest()
+
+    if form.cleaned_data["u"]:
+        # We are live-loading more events
+        start = form.cleaned_data["u"] + td(microseconds=1)
+        end = now()
+    else:
+        # We're applying new filters
+        start = check.created
+        end = form.cleaned_data["end"] or now()
+
+    # clamp start to the date of the oldest visible ping
+    oldest_ping = check.visible_pings.order_by("n").first()
+    if oldest_ping:
+        start = max(start, oldest_ping.created)
+
+    events = _get_events(check, 1000, start=start, end=end, kinds=form.kinds())
+    response = render(request, "front/log_rows.html", {"events": events})
+
+    if events:
+        # Include a full precision timestamp of the most recent event in a
+        # response header. This will be used client-side for fetching live updates
+        # to specify "return any events after *this* point".
+        response["X-Last-Event-Timestamp"] = str(events[0].created.timestamp())
+    return response
 
 
 # Forks: add custom views after this line

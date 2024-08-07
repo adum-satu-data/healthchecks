@@ -3,17 +3,18 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 from threading import Thread
-from typing import cast
 from uuid import UUID
 
 from django.conf import settings
-from statsd.defaults.env import statsd
+
+from hc.lib.statsd import statsd
 
 try:
-    from minio import Minio, S3Error
+    from minio import InvalidResponseError, Minio, S3Error
     from minio.deleteobjects import DeleteObject
     from urllib3 import PoolManager
     from urllib3.exceptions import HTTPError, ReadTimeoutError
+    from urllib3.util import Retry
 except ImportError:
     # Enforce
     settings.S3_BUCKET = None
@@ -34,7 +35,10 @@ def client() -> Minio:
             settings.S3_ACCESS_KEY,
             settings.S3_SECRET_KEY,
             region=settings.S3_REGION,
-            http_client=PoolManager(timeout=settings.S3_TIMEOUT),
+            secure=settings.S3_SECURE,
+            http_client=PoolManager(
+                timeout=settings.S3_TIMEOUT, retries=Retry(total=1)
+            ),
         )
 
     return _client
@@ -77,7 +81,7 @@ def get_object(code: str, n: int) -> bytes | None:
         response = None
         try:
             response = client().get_object(settings.S3_BUCKET, key)
-            return cast(bytes, response.read())
+            return response.read()
         except S3Error as e:
             if e.code == "NoSuchKey":
                 # It's not an error condition if an object does not exist.
@@ -85,6 +89,10 @@ def get_object(code: str, n: int) -> bytes | None:
                 return None
 
             logger.exception("S3Error in hc.lib.s3.get_object")
+            statsd.incr("hc.lib.s3.getObjectErrors")
+            return None
+        except InvalidResponseError:
+            logger.exception("InvalidResponseError in hc.lib.s3.get_object")
             statsd.incr("hc.lib.s3.getObjectErrors")
             return None
         except HTTPError:

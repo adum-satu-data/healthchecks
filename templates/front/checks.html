@@ -2,6 +2,13 @@
 {% load compress static hc_extras %}
 
 {% block title %}{{ num_down|num_down_title }}{% endblock %}
+{% block favicon %}
+    {% if num_down %}
+    <link rel="icon" type="image/svg+xml" href="{% static 'img/favicon_down.svg' %}">
+    {% else %}
+    <link rel="icon" type="image/svg+xml" href="{% static 'img/favicon.svg' %}">
+    {% endif %}
+{% endblock %}
 
 {% block content %}
 
@@ -55,8 +62,8 @@
 {% if checks %}
 <div class="row">
     <div id="my-checks-tags" class="col-sm-9">
-        {% for tag, status in tags %}
-            <div class="btn btn-xs {{ status }} {% if tag in selected_tags %}checked{% endif%}">{{ tag }}</div>
+        {% for tag, status, tooltip in tags %}
+            <div data-tooltip="{{ tooltip }}" class="btn btn-xs {{ status }} {% if tag in selected_tags %}checked{% endif%}">{{ tag }}</div>
         {% endfor %}
     </div>
     <div class="col-sm-3">
@@ -146,6 +153,8 @@
 <script src="{% static 'js/initialize-timezone-selects.js' %}"></script>
 <script src="{% static 'js/update-timeout-modal.js' %}"></script>
 <script src="{% static 'js/adaptive-setinterval.js' %}"></script>
+<script src="{% static 'js/moment.min.js' %}"></script>
+<script src="{% static 'js/moment-timezone-with-data-10-year-range.min.js' %}"></script>
 <script src="{% static 'js/ping_details.js' %}"></script>
 <script src="{% static 'js/checks.js' %}"></script>
 <script src="{% static 'js/add-check-modal.js' %}"></script>

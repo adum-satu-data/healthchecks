@@ -71,6 +71,14 @@
     padding: 40px;
 }
 
+#update-timeout-grace-cron {
+    xwidth: 70px;
+}
+
+#update-timeout-grace-cron-unit {
+    width: 90px;
+}
+
 #update-cron-form label,
 #update-oncalendar-form label {
     font-weight: normal;
@@ -135,6 +143,11 @@
     padding: 25px;
 }
 
+#update-timeout-grace-oncalendar,
+#update-timeout-grace-oncalendar-unit {
+    width: 90px;
+}
+
 #oncalendar-preview {
     background: var(--pre-bg);
     min-height: 409px;
@@ -167,3 +180,11 @@
 #oncalendar-preview tr.from-now td {
     font-size: small;
 }
+
+.select-group {
+    display: flex;
+}
+
+.select-group select { 
+    border-left: 0;
+} 

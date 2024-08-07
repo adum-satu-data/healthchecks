@@ -41,7 +41,7 @@ from hc.api.models import MAX_DURATION, Channel, Check, Flip, Notification, Ping
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string
-from hc.lib.tz import all_timezones
+from hc.lib.tz import all_timezones, legacy_timezones
 
 
 class BadChannelException(Exception):
@@ -99,6 +99,11 @@ class Spec(BaseModel):
     @field_validator("tz")
     @classmethod
     def check_tz(cls, v: str) -> str:
+        if v in legacy_timezones:
+            # Replace legacy timezone with the current canonical time zone
+            # (for example, Europe/Kiev -> Europe/Kyiv)
+            v = legacy_timezones[v]
+
         if v not in all_timezones:
             raise PydanticCustomError("tz_syntax", "not a valid timezone")
         return v
@@ -445,8 +450,7 @@ def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
 @csrf_exempt
 @authorize_read
 def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return JsonResponse(check.to_dict(readonly=request.readonly, v=request.v))
     return HttpResponseNotFound()
@@ -655,8 +659,7 @@ def flips_by_uuid(request: ApiRequest, code: UUID) -> HttpResponse:
 @csrf_exempt
 @authorize_read
 def flips_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return flips(request, check)
     return HttpResponseNotFound()
@@ -667,7 +670,7 @@ def flips_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
 @authorize_read
 def badges(request: ApiRequest) -> JsonResponse:
     tags = set(["*"])
-    for check in Check.objects.filter(project=request.project):
+    for check in request.project.check_set.all():
         tags.update(check.tags_list())
 
     key = request.project.badge_key
@@ -683,6 +686,20 @@ def badges(request: ApiRequest) -> JsonResponse:
         }
 
     return JsonResponse({"badges": badges})
+
+
+SHIELDS_COLORS = {"up": "success", "late": "important", "down": "critical"}
+
+
+def _shields_response(label: str, status: str) -> JsonResponse:
+    return JsonResponse(
+        {
+            "schemaVersion": 1,
+            "label": label,
+            "message": status,
+            "color": SHIELDS_COLORS[status],
+        }
+    )
 
 
 @never_cache
@@ -701,11 +718,11 @@ def badge(
         return HttpResponseNotFound()
 
     q = Check.objects.filter(project__badge_key=badge_key)
-    if tag != "*":
+    if tag == "*":
+        label = settings.MASTER_BADGE_LABEL
+    else:
         q = q.filter(tags__contains=tag)
         label = tag
-    else:
-        label = settings.MASTER_BADGE_LABEL
 
     status, total, grace, down = "up", 0, 0, 0
     for check in q:
@@ -728,15 +745,7 @@ def badge(
                 status = "late"
 
     if fmt == "shields":
-        color = "success"
-        if status == "down":
-            color = "critical"
-        elif status == "late":
-            color = "important"
-
-        return JsonResponse(
-            {"schemaVersion": 1, "label": label, "message": status, "color": color}
-        )
+        return _shields_response(label, status)
 
     if fmt == "json":
         return JsonResponse(
@@ -744,6 +753,39 @@ def badge(
         )
 
     svg = get_badge_svg(label, status)
+    return HttpResponse(svg, content_type="image/svg+xml")
+
+
+@never_cache
+@cors("GET")
+def check_badge(
+    request: HttpRequest, states: int, badge_key: UUID, fmt: str
+) -> HttpResponse:
+    if fmt not in ("svg", "json", "shields"):
+        return HttpResponseNotFound()
+
+    check = get_object_or_404(Check, badge_key=badge_key)
+    check_status = check.get_status()
+    status = "up"
+    if check_status == "down":
+        status = "down"
+    elif check_status == "grace" and states == 3:
+        status = "late"
+
+    if fmt == "shields":
+        return _shields_response(check.name_then_code(), status)
+
+    if fmt == "json":
+        return JsonResponse(
+            {
+                "status": status,
+                "total": 1,
+                "grace": 1 if check_status == "grace" else 0,
+                "down": 1 if check_status == "down" else 0,
+            }
+        )
+
+    svg = get_badge_svg(check.name_then_code(), status)
     return HttpResponse(svg, content_type="image/svg+xml")
 
 

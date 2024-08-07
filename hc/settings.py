@@ -246,6 +246,11 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_REGION = os.getenv("S3_REGION")
 S3_BUCKET = os.getenv("S3_BUCKET")
 S3_TIMEOUT = envint("S3_TIMEOUT", "60")
+S3_SECURE = envbool("S3_SECURE", "True")
+
+# To enable statsd metric collection, set STATSD_HOST="host:hostport"
+# (example: "localhost:8125")
+STATSD_HOST = os.getenv("STATSD_HOST")
 
 # Integrations
 
@@ -322,6 +327,8 @@ TWILIO_AUTH = os.getenv("TWILIO_AUTH")
 TWILIO_FROM = os.getenv("TWILIO_FROM")
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
 TWILIO_USE_WHATSAPP = envbool("TWILIO_USE_WHATSAPP", "False")
+WHATSAPP_DOWN_CONTENT_SID = os.getenv("WHATSAPP_DOWN_CONTENT_SID")
+WHATSAPP_UP_CONTENT_SID = os.getenv("WHATSAPP_UP_CONTENT_SID")
 
 # Trello
 TRELLO_APP_KEY = os.getenv("TRELLO_APP_KEY")

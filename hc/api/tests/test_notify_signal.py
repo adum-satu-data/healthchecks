@@ -13,8 +13,8 @@ from django.core.mail import EmailMessage, EmailMultiAlternatives
 from django.test.utils import override_settings
 from django.utils.timezone import now
 
-from hc.api.models import Channel, Check, Notification, Ping, TokenBucket
-from hc.test import BaseTestCase, nolog
+from hc.api.models import Channel, Check, Flip, Notification, Ping, TokenBucket
+from hc.test import BaseTestCase
 
 # Address is either a string (the path to the unix socket)
 # or a host:port tuple.
@@ -78,13 +78,16 @@ class NotifySignalTestCase(BaseTestCase):
         self.check = Check(project=self.project)
         self.check.name = "Daily Backup"
         self.check.tags = "foo bar"
-        self.check.status = "down"
-        self.check.last_ping = now() - td(minutes=61)
+        # Transport classes should use flip.new_status,
+        # so the status "paused" should not appear anywhere
+        self.check.status = "paused"
+        self.check.last_ping = now()
         self.check.n_pings = 123
         self.check.save()
 
         self.ping = Ping(owner=self.check)
-        self.ping.n = 1
+        self.ping.created = now() - td(minutes=10)
+        self.ping.n = 112233
         self.ping.remote_addr = "1.2.3.4"
         self.ping.body_raw = b"Body Line 1\nBody Line 2"
         self.ping.save()
@@ -96,6 +99,11 @@ class NotifySignalTestCase(BaseTestCase):
         self.channel.save()
         self.channel.checks.add(self.check)
 
+        self.flip = Flip(owner=self.check)
+        self.flip.created = now()
+        self.flip.old_status = "new"
+        self.flip.new_status = "down"
+
     def get_html(self, email: EmailMessage) -> str:
         assert isinstance(email, EmailMultiAlternatives)
         html, _ = email.alternatives[0]
@@ -106,7 +114,7 @@ class NotifySignalTestCase(BaseTestCase):
     def test_it_works(self, socket: Mock) -> None:
         socketobj = setup_mock(socket, {})
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         self.assertEqual(socketobj.address, "/tmp/socket")
 
         n = Notification.objects.get()
@@ -120,8 +128,8 @@ class NotifySignalTestCase(BaseTestCase):
         self.assertIn("Project: Alices Project", params["message"])
         self.assertIn("Tags: foo, bar", params["message"])
         self.assertIn("Period: 1 day", params["message"])
-        self.assertIn("Total Pings: 123", params["message"])
-        self.assertIn("Last Ping: Success, now", params["message"])
+        self.assertIn("Total Pings: 112233", params["message"])
+        self.assertIn("Last Ping: Success, 10 minutes ago", params["message"])
         self.assertIn("+123456789", params["recipient"])
 
         # Only one check in the project, so there should be no note about
@@ -136,7 +144,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.ping.exitstatus = 123
         self.ping.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         self.assertEqual(socketobj.address, "/tmp/socket")
 
         n = Notification.objects.get()
@@ -144,20 +152,35 @@ class NotifySignalTestCase(BaseTestCase):
 
         assert socketobj.req
         params = socketobj.req["params"]
-        self.assertIn("Last Ping: Exit status 123, now", params["message"])
+        self.assertIn("Last Ping: Exit status 123, 10 minutes ago", params["message"])
 
     @patch("hc.api.transports.socket.socket")
-    def test_it_shows_schedule_and_tz(self, socket: Mock) -> None:
+    def test_it_shows_cron_schedule_and_tz(self, socket: Mock) -> None:
         socketobj = setup_mock(socket, {})
 
         self.check.kind = "cron"
         self.check.tz = "Europe/Riga"
         self.check.save()
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         assert socketobj.req
         params = socketobj.req["params"]
         self.assertIn("Schedule: * * * * *", params["message"])
+        self.assertIn("Time Zone: Europe/Riga", params["message"])
+
+    @patch("hc.api.transports.socket.socket")
+    def test_it_shows_oncalendar_schedule_and_tz(self, socket: Mock) -> None:
+        socketobj = setup_mock(socket, {})
+
+        self.check.kind = "oncalendar"
+        self.check.schedule = "Mon 2-29"
+        self.check.tz = "Europe/Riga"
+        self.check.save()
+        self.channel.notify(self.flip)
+
+        assert socketobj.req
+        params = socketobj.req["params"]
+        self.assertIn("Schedule: Mon 2-29", params["message"])
         self.assertIn("Time Zone: Europe/Riga", params["message"])
 
     @patch("hc.api.transports.socket.socket")
@@ -171,7 +194,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.check.tags = "foo a&b"
         self.check.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         self.assertEqual(socketobj.address, "/tmp/socket")
 
         n = Notification.objects.get()
@@ -188,7 +211,7 @@ class NotifySignalTestCase(BaseTestCase):
     def test_it_handles_host_port(self, socket: Mock) -> None:
         socketobj = setup_mock(socket, {})
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         self.assertEqual(socketobj.address, ("example.org", 1234))
 
         n = Notification.objects.get()
@@ -200,7 +223,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.channel.value = json.dumps(payload)
         self.channel.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         # This channel should not notify on "down" events:
         self.assertEqual(Notification.objects.count(), 0)
@@ -209,7 +232,7 @@ class NotifySignalTestCase(BaseTestCase):
     @patch("hc.api.transports.socket.socket")
     def test_it_requires_signal_cli_socket(self, socket: Mock) -> None:
         with override_settings(SIGNAL_CLI_SOCKET=None):
-            self.channel.notify(self.check)
+            self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "Signal notifications are not enabled")
@@ -222,7 +245,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.check.name = "Foo & Bar"
         self.check.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         assert socketobj.req
         self.assertIn("Foo & Bar", socketobj.req["params"]["message"])
@@ -235,7 +258,7 @@ class NotifySignalTestCase(BaseTestCase):
         obj.tokens = 0
         obj.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         n = Notification.objects.get()
         self.assertEqual(n.error, "Rate limit exceeded")
         socket.assert_not_called()
@@ -250,7 +273,7 @@ class NotifySignalTestCase(BaseTestCase):
         other.last_ping = now() - td(minutes=61)
         other.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         assert socketobj.req
         message = socketobj.req["params"]["message"]
@@ -266,12 +289,25 @@ class NotifySignalTestCase(BaseTestCase):
         other.last_ping = now() - td(minutes=61)
         other.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         assert socketobj.req
         message = socketobj.req["params"]["message"]
         self.assertIn("The following checks are also down", message)
         self.assertIn("Foobar & Co", message)
+        self.assertIn("(last ping: an hour ago)", message)
+
+    @patch("hc.api.transports.socket.socket")
+    def test_it_handles_other_checks_with_no_last_ping(self, socket: Mock) -> None:
+        socketobj = setup_mock(socket, {})
+
+        Check.objects.create(project=self.project, status="down")
+
+        self.channel.notify(self.flip)
+
+        assert socketobj.req
+        message = socketobj.req["params"]["message"]
+        self.assertIn("(last ping: never)", message)
 
     @patch("hc.api.transports.socket.socket")
     def test_it_does_not_show_more_than_10_other_checks(self, socket: Mock) -> None:
@@ -284,19 +320,18 @@ class NotifySignalTestCase(BaseTestCase):
             other.last_ping = now() - td(minutes=61)
             other.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         assert socketobj.req
         message = socketobj.req["params"]["message"]
         self.assertNotIn("Foobar", message)
         self.assertIn("11 other checks are also down.", message)
 
-    @nolog
     @patch("hc.api.transports.logger")
     @patch("hc.api.transports.socket.socket")
     def test_it_handles_unexpected_payload(self, socket: Mock, logger: Mock) -> None:
         setup_mock(socket, "surprise")
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "signal-cli call failed (unexpected response)")
@@ -323,7 +358,7 @@ class NotifySignalTestCase(BaseTestCase):
         }
         setup_mock(socket, msg)
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         # It should disable the channel, so we don't attempt deliveries to
         # this recipient in the future
@@ -333,8 +368,9 @@ class NotifySignalTestCase(BaseTestCase):
         self.assertEqual(n.error, "Recipient not found")
 
     @patch("hc.api.transports.socket.socket")
-    def test_it_ignores_unexpected_recipient(self, socket: Mock) -> None:
+    def test_it_handles_unregistered_and_null_number(self, socket: Mock) -> None:
         msg = {
+            "jsonrpc": "2.0",
             "error": {
                 "code": -1,
                 "message": "Failed to send message",
@@ -342,7 +378,10 @@ class NotifySignalTestCase(BaseTestCase):
                     "response": {
                         "results": [
                             {
-                                "recipientAddress": {"number": "+999999999"},
+                                "recipientAddress": {
+                                    "uuid": "3feed650-c9a3-4cde-9775-0ad0608f407a",
+                                    "number": None,
+                                },
                                 "type": "UNREGISTERED_FAILURE",
                             }
                         ],
@@ -352,28 +391,33 @@ class NotifySignalTestCase(BaseTestCase):
         }
         setup_mock(socket, msg)
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
+        # It should disable the channel, so we don't attempt deliveries to
+        # this recipient in the future
+        self.channel.refresh_from_db()
+        self.assertTrue(self.channel.disabled)
         n = Notification.objects.get()
-        # UNREGISTERED_FAILURE is reported for a different recipient,
-        # so it should not appear in the error message:
-        self.assertEqual(n.error, "signal-cli call failed (-1)")
+        self.assertEqual(n.error, "Recipient not found")
 
+    @patch("hc.api.transports.logger")
     @patch("hc.api.transports.socket.socket")
-    def test_it_handles_error_code(self, socket: Mock) -> None:
+    def test_it_handles_error_code(self, socket: Mock, logger: Mock) -> None:
         setup_mock(socket, {"error": {"code": 123}})
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "signal-cli call failed (123)")
+
+        self.assertTrue(logger.error.called)
 
     @patch("hc.api.transports.socket.socket")
     def test_it_handles_oserror(self, socket: Mock) -> None:
         setup_mock(socket, {}, side_effect=OSError("oops"))
 
         logging.disable(logging.CRITICAL)
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
         logging.disable(logging.NOTSET)
 
         n = Notification.objects.get()
@@ -386,7 +430,7 @@ class NotifySignalTestCase(BaseTestCase):
         # The socket reader should skip over it.
         socketobj.outbox += b'{"id": "surprise"}\n'
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "")
@@ -400,7 +444,7 @@ class NotifySignalTestCase(BaseTestCase):
         # Add a message with no id in the outbox. The socket reader should skip over it.
         socketobj.outbox += b"{}\n"
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "")
@@ -433,7 +477,7 @@ class NotifySignalTestCase(BaseTestCase):
         self.check.name = "Foo & Co"
         self.check.save()
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "CAPTCHA proof required")
@@ -469,7 +513,7 @@ class NotifySignalTestCase(BaseTestCase):
         }
         setup_mock(socket, msg)
 
-        self.channel.notify(self.check)
+        self.channel.notify(self.flip)
 
         n = Notification.objects.get()
         self.assertEqual(n.error, "signal-cli call failed (-32602)")

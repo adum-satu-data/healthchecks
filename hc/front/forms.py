@@ -27,6 +27,10 @@ def _is_latin1(s: str) -> bool:
         return False
 
 
+def _choices(csv: str) -> list[tuple[str, str]]:
+    return [(v, v) for v in csv.split(",")]
+
+
 class LaxURLField(forms.URLField):
     default_validators = [WebhookValidator()]
 
@@ -85,9 +89,7 @@ class NameTagsForm(forms.Form):
 
 
 class AddCheckForm(NameTagsForm):
-    kind = forms.ChoiceField(
-        choices=(("simple", "simple"), ("cron", "cron"), ("oncalendar", "oncalendar"))
-    )
+    kind = forms.ChoiceField(choices=_choices("simple,cron,oncalendar"))
     timeout = forms.IntegerField(min_value=60, max_value=31536000)
     schedule = forms.CharField(required=False, max_length=100)
     tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
@@ -140,13 +142,19 @@ class TimeoutForm(forms.Form):
 class CronForm(forms.Form):
     schedule = forms.CharField(max_length=100, validators=[CronValidator()])
     tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
-    grace = forms.IntegerField(min_value=1, max_value=43200)
+    grace = forms.IntegerField(min_value=60, max_value=31536000)
+
+    def clean_grace(self) -> td:
+        return td(seconds=self.cleaned_data["grace"])
 
 
 class OnCalendarForm(forms.Form):
     schedule = forms.CharField(max_length=100, validators=[OnCalendarValidator()])
     tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
-    grace = forms.IntegerField(min_value=1, max_value=43200)
+    grace = forms.IntegerField(min_value=60, max_value=31536000)
+
+    def clean_grace(self) -> td:
+        return td(seconds=self.cleaned_data["grace"])
 
 
 class AddOpsgenieForm(forms.Form):
@@ -192,19 +200,16 @@ class AddUrlForm(forms.Form):
     value = LaxURLField(max_length=1000)
 
 
-METHODS = ("GET", "POST", "PUT")
-
-
 class WebhookForm(forms.Form):
     error_css_class = "has-error"
     name = forms.CharField(max_length=100, required=False)
 
-    method_down = forms.ChoiceField(initial="GET", choices=zip(METHODS, METHODS))
+    method_down = forms.ChoiceField(initial="GET", choices=_choices("GET,POST,PUT"))
     body_down = forms.CharField(max_length=1000, required=False)
     headers_down = HeadersField(required=False)
     url_down = LaxURLField(max_length=1000, required=False)
 
-    method_up = forms.ChoiceField(initial="GET", choices=zip(METHODS, METHODS))
+    method_up = forms.ChoiceField(initial="GET", choices=_choices("GET,POST,PUT"))
     body_up = forms.CharField(max_length=1000, required=False)
     headers_up = HeadersField(required=False)
     url_up = LaxURLField(max_length=1000, required=False)
@@ -376,16 +381,31 @@ class SearchForm(forms.Form):
     q = forms.RegexField(regex=r"^[0-9a-zA-Z\s]{3,100}$")
 
 
-class SeekForm(forms.Form):
+class LogFiltersForm(forms.Form):
     # min_value is 2010-01-01, max_value is 2030-01-01
-    start = forms.IntegerField(min_value=1262296800, max_value=1893448800)
-    end = forms.IntegerField(min_value=1262296800, max_value=1893448800)
+    u = forms.FloatField(min_value=1262296800, max_value=1893448800, required=False)
+    end = forms.FloatField(min_value=1262296800, max_value=1893448800, required=False)
+    success = forms.BooleanField(required=False)
+    fail = forms.BooleanField(required=False)
+    start = forms.BooleanField(required=False)
+    log = forms.BooleanField(required=False)
+    ign = forms.BooleanField(required=False)
+    notification = forms.BooleanField(required=False)
+    flip = forms.BooleanField(required=False)
 
-    def clean_start(self) -> datetime:
-        return datetime.fromtimestamp(self.cleaned_data["start"], tz=timezone.utc)
+    def clean_u(self) -> datetime | None:
+        if self.cleaned_data["u"]:
+            return datetime.fromtimestamp(self.cleaned_data["u"], tz=timezone.utc)
+        return None
 
-    def clean_end(self) -> datetime:
-        return datetime.fromtimestamp(self.cleaned_data["end"], tz=timezone.utc)
+    def clean_end(self) -> datetime | None:
+        if self.cleaned_data["end"]:
+            return datetime.fromtimestamp(self.cleaned_data["end"], tz=timezone.utc)
+        return None
+
+    def kinds(self) -> tuple[str, ...]:
+        kind_keys = ("success", "fail", "start", "log", "ign", "notification", "flip")
+        return tuple(key for key in kind_keys if self.cleaned_data[key])
 
 
 class TransferForm(forms.Form):
@@ -394,3 +414,11 @@ class TransferForm(forms.Form):
 
 class AddTelegramForm(forms.Form):
     project = forms.UUIDField()
+
+
+class BadgeSettingsForm(forms.Form):
+    target = forms.ChoiceField(choices=_choices("all,tag,check"))
+    tag = forms.CharField(max_length=100, required=False)
+    check = forms.UUIDField(required=False)
+    fmt = forms.ChoiceField(choices=_choices("svg,json,shields"))
+    states = forms.ChoiceField(choices=_choices("2,3"))

@@ -61,6 +61,7 @@ from environment variables. Below is a list of variables it reads and uses.
 <li><a href="#S3_REGION">S3_REGION</a></li>
 <li><a href="#S3_SECRET_KEY">S3_SECRET_KEY</a></li>
 <li><a href="#S3_TIMEOUT">S3_TIMEOUT</a></li>
+<li><a href="#S3_SECURE">S3_SECURE</a></li>
 <li><a href="#SECRET_KEY">SECRET_KEY</a></li>
 <li><a href="#SHELL_ENABLED">SHELL_ENABLED</a></li>
 <li><a href="#SIGNAL_CLI_SOCKET">SIGNAL_CLI_SOCKET</a></li>
@@ -82,6 +83,8 @@ from environment variables. Below is a list of variables it reads and uses.
 <li><a href="#USE_PAYMENTS">USE_PAYMENTS</a></li>
 <li><a href="#VICTOROPS_ENABLED">VICTOROPS_ENABLED</a></li>
 <li><a href="#WEBHOOKS_ENABLED">WEBHOOKS_ENABLED</a></li>
+<li><a href="#WHATSAPP_DOWN_CONTENT_SID">WHATSAPP_DOWN_CONTENT_SID</a></li>
+<li><a href="#WHATSAPP_UP_CONTENT_SID">WHATSAPP_UP_CONTENT_SID</a></li>
 <li><a href="#ZULIP_ENABLED">ZULIP_ENABLED</a></li>
 </ul>
 
@@ -440,11 +443,23 @@ Default: `localhost`
 The domain to use for generating ping email addresses. Example:
 
 ```ini
-PING_EMAIL_DOMAIN=ping.my-hc.example.org
+PING_EMAIL_DOMAIN=hc.example.org
 ```
 
 In this example, Healthchecks would generate ping email addresses similar
-to `3f1a7317-8e96-437c-a17d-b0d550b51e86@ping.my-hc.example.org`.
+to `3f1a7317-8e96-437c-a17d-b0d550b51e86@hc.example.org`.
+
+This setting only controls how the ping email addresses are constructed, and
+does not by itself enable the ping-by-sending-email functionality. To receive
+emails, you will also need:
+
+* A DNS record pointing `hc.example.org` to your Healthchecks
+  instance's IP address.
+* `manage.py smtpd` (Healthchecks' SMTP listener service) running, listening
+  on port 25, and reachable from the outside world. If you are using the
+  [official Docker image](https://hub.docker.com/r/healthchecks/healthchecks),
+  see [the instructions here](../self_hosted_docker/#SMTPD_PORT) for enabling the SMTP
+  listener service.
 
 ## `PING_ENDPOINT` {: #PING_ENDPOINT }
 
@@ -661,6 +676,13 @@ Default: `60`
 
 Timeout for individual S3 operations, in seconds.
 
+## `S3_SECURE` {: #S3_SECURE }
+
+Default: `True`
+
+Whether to use secure (TLS) connection to S3 or not. To
+use unencrypted HTTP requests, set this value to `False`.
+
 ## `SECRET_KEY` {: #SECRET_KEY }
 
 Default: `---`
@@ -782,7 +804,7 @@ The integration can work with or without the Slack Client ID. If
 the Slack Client ID is not set, in the "Integrations - Add Slack" page,
 Healthchecks will ask the user to provide a webhook URL for posting notifications.
 
-If the Slack Client _is_ set, Healthchecks will use the OAuth2 flow
+If the Slack Client ID _is_ set, Healthchecks will use the OAuth2 flow
 to get the webhook URL from Slack. The OAuth2 flow is more user-friendly.
 To set it up, go to [https://api.slack.com/apps/](https://api.slack.com/apps/)
 and create a _Slack app_. When setting up the Slack app, make sure to:
@@ -882,16 +904,15 @@ TWILIO_FROM=+15017122661
 
 Default: `None`
 
-Optional, the Twilio Messaging Service SID for sending SMS and WhatsApp notifications.
+The Twilio Messaging Service SID for sending SMS and WhatsApp notifications.
 
-If `TWILIO_MESSAGING_SERVICE_SID` is specified, Healthchecks will include it in the
-"MessagingServiceSid" field when sending SMS and WhatsApp messages via Twilio API.
-This will result in Twilio using a Messaging Service instead of a plain sender number
-to deliver the SMS and WhatsApp messages.
+`TWILIO_MESSAGING_SERVICE_SID` is **required** for sending WhatsApp notifications.
 
-If `TWILIO_MESSAGING_SERVICE_SID` is not set, Healthchecks will fall back to using
-the "From" field with the value configured in [TWILIO_FROM](#TWILIO_FROM) in API
-requests.
+`TWILIO_MESSAGING_SERVICE_SID` is **optional** for sending SMS notifications. If specified,
+Healthchecks will pass it in the "MessagingServiceSid" field to Twilio API. This will
+result in Twilio using a Messaging Service instead of a plain sender number to deliver
+the SMS messages. If not specified, Healthchecks will fall back to using
+the "From" field with the value configured in [TWILIO_FROM](#TWILIO_FROM).
 
 Example:
 
@@ -903,7 +924,15 @@ TWILIO_MESSAGING_SERVICE_SID=MGe56e622d540e6badc52ae0ac4af028c6
 
 Default: `False`
 
-A boolean that turns on/off the WhatsApp integration.
+A boolean that turns on/off the WhatsApp integration. For the WhatsApp integration
+to work, you will also need to specify:
+
+* [TWILIO_ACCOUNT](#TWILIO_ACCOUNT)
+* [TWILIO_AUTH](#TWILIO_AUTH)
+* [TWILIO_FROM](#TWILIO_FROM)
+* [TWILIO_MESSAGING_SERVICE_SID](#TWILIO_MESSAGING_SERVICE_SID)
+* [WHATSAPP_DOWN_CONTENT_SID](#WHATSAPP_DOWN_CONTENT_SID)
+* [WHATSAPP_UP_CONTENT_SID](#WHATSAPP_UP_CONTENT_SID).
 
 ## `USE_PAYMENTS` {: #USE_PAYMENTS }
 
@@ -923,6 +952,40 @@ Enabled by default.
 Default: `True`
 
 A boolean that turns on/off the Webhooks integration. Enabled by default.
+
+## `WHATSAPP_DOWN_CONTENT_SID` {: #WHATSAPP_DOWN_CONTENT_SID }
+
+Default: `None`
+
+Identifier of the Twilio content template to use for WhatsApp "down" notifications.
+Required by the WhatsApp integration.
+
+Meta requires WhatsApp message templates to be pre-registered and approved.
+Create a content template in your Twilio account with the following contents:
+
+````
+The check “{{1}}” is DOWN.
+````
+
+You can tweak the message contents as needed, but make sure it has a single placeholder
+similar to the above example.
+
+## `WHATSAPP_UP_CONTENT_SID` {: #WHATSAPP_UP_CONTENT_SID }
+
+Default: `None`
+
+Identifier of the Twilio content template to use for WhatsApp "up" notifications.
+Required by the WhatsApp integration.
+
+Meta requires WhatsApp message templates to be pre-registered and approved.
+Create a content template in your Twilio account with the following contents:
+
+````
+The check “{{1}}” is now UP.
+````
+
+You can tweak the message contents as needed, but make sure it has a single placeholder
+similar to the above example.
 
 ## `ZULIP_ENABLED` {: #ZULIP_ENABLED }
 
